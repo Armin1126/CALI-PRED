@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data and Checkpoints
+data/
+checkpoints/
+checkpoints_*/
+*.csv
+*.npz
+*.pt
+*.pth
+
+# Visualizations and Logs
+*.png
+*.log
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs and Tools
+.vscode/
+.idea/
+.gemini/
