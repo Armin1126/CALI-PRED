@@ -319,6 +319,7 @@ def train_model(
     checkpoint_dir: str = "checkpoints",
     use_real_dti: bool = True,
     missing_rate_sampler: Optional[Callable[[], float]] = None,
+    sigma_lr_multiplier: float = 2.5,
 ) -> dict:
     """
     Real DataLoader-based training loop with:
@@ -335,8 +336,8 @@ def train_model(
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     # Decoupled learning rates for sigma head and trust parameters if multiplier != 1.0
-    if hasattr(model, "sigma_head") and getattr(model, "sigma_lr_multiplier", 1.0) != 1.0:
-        sigma_lr_mult = model.sigma_lr_multiplier
+    if hasattr(model, "sigma_head") and sigma_lr_multiplier != 1.0:
+        sigma_lr_mult = sigma_lr_multiplier
         sigma_params = list(model.sigma_head.parameters())
         if hasattr(model, "sigma_temperature_raw"):
             sigma_params.append(model.sigma_temperature_raw)
@@ -876,6 +877,7 @@ def main(args: argparse.Namespace) -> None:
         checkpoint_dir=args.checkpoint_dir,
         use_real_dti=True,
         missing_rate_sampler=train_val_sampler,
+        sigma_lr_multiplier=args.sigma_lr_multiplier,
     )
 
     # ------------------------------------------------------------------ #
@@ -915,6 +917,7 @@ def main(args: argparse.Namespace) -> None:
         checkpoint_dir=args.checkpoint_dir,
         use_real_dti=False,
         missing_rate_sampler=train_val_sampler,
+        sigma_lr_multiplier=args.sigma_lr_multiplier,
     )
 
     # ------------------------------------------------------------------ #
@@ -1131,8 +1134,8 @@ if __name__ == "__main__":
               "only; intended for the calibration experiment."),
     )
     parser.add_argument(
-        "--sigma-lr-multiplier", type=float, default=1.0,
-        help="Multiplier for the learning rate of the sigma head (default: 1.0).",
+        "--sigma-lr-multiplier", type=float, default=2.5,
+        help="Multiplier for the learning rate of the sigma head (default: 2.5).",
     )
     parser.add_argument(
         "--use-temperature", action="store_true",
