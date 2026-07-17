@@ -363,13 +363,15 @@ def train_model(
     )
 
     history = {
-        "train_loss": [], "val_loss": [], "best_epoch": 0,
+        "train_loss": [], "val_loss": [], "ema_val_loss": [], "best_epoch": 0,
         "train_nll": [], "val_nll": [], "train_pinball": [], "val_pinball": [],
         "train_sigma_base": [], "val_sigma_base": [],
         "train_inflation": [], "val_inflation": [], "train_z_rmse": [], "val_z_rmse": [],
         "train_mae": [], "val_mae": [],
     }
     best_val_loss = float("inf")
+    ema_val_loss = None
+    ema_alpha = 0.3  # EMA smoothing: dampen single-epoch spikes in non-monotonic NLL
     patience = 10
     patience_counter = 0
 
@@ -507,7 +509,14 @@ def train_model(
         avg_val_sigma_base = np.mean(val_base_sigmas) if val_base_sigmas else 0.0
         avg_val_inflation = np.mean(val_inflations) if val_inflations else 1.0
 
+        # Update EMA of validation loss for smoothed checkpoint selection
+        if ema_val_loss is None:
+            ema_val_loss = avg_val_loss
+        else:
+            ema_val_loss = ema_alpha * avg_val_loss + (1.0 - ema_alpha) * ema_val_loss
+
         history["val_loss"].append(avg_val_loss)
+        history["ema_val_loss"].append(ema_val_loss)
         history["val_nll"].append(float(np.mean(val_nlls)))
         history["val_pinball"].append(float(np.mean(val_pinballs)))
         history["val_sigma_base"].append(float(avg_val_sigma_base))
@@ -518,8 +527,8 @@ def train_model(
         # --- Logging ------------------------------------------------------- #
         lr_current = scheduler.get_last_lr()[0]
         logger.info(
-            "[%s] Epoch %02d/%02d | train_loss=%.4f | val_loss=%.4f | lr=%.6f",
-            model_label, epoch + 1, epochs, avg_train_loss, avg_val_loss, lr_current,
+            "[%s] Epoch %02d/%02d | train_loss=%.4f | val_loss=%.4f | ema_val=%.4f | lr=%.6f",
+            model_label, epoch + 1, epochs, avg_train_loss, avg_val_loss, ema_val_loss, lr_current,
         )
         logger.info(
             "  -> Train: MAE=%.4f | BaseSigma=%.4f | Inflation=%.4f",
@@ -530,9 +539,9 @@ def train_model(
             avg_val_mae, avg_val_sigma_base, avg_val_inflation
         )
 
-        # --- Early stopping + checkpointing ------------------------------- #
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        # --- Early stopping + checkpointing (EMA-smoothed) ---------------- #
+        if ema_val_loss < best_val_loss:
+            best_val_loss = ema_val_loss
             history["best_epoch"] = epoch + 1
             patience_counter = 0
             ckpt_path = os.path.join(
@@ -545,7 +554,7 @@ def train_model(
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": best_val_loss,
             }, ckpt_path)
-            logger.info("  Saved best checkpoint (val_loss=%.4f) → '%s'", best_val_loss, ckpt_path)
+            logger.info("  Saved best checkpoint (ema_val=%.4f) → '%s'", best_val_loss, ckpt_path)
         else:
             patience_counter += 1
             if patience_counter >= patience:

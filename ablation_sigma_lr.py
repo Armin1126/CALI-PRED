@@ -297,12 +297,22 @@ def main(args: argparse.Namespace) -> None:
                 except Exception:
                     sigma_scale = 1.0
 
-                # Final Evaluation on Held-out test set
-                eval_test = evaluate_model(
+                # Raw evaluation on test set (sigma_scale=1.0, no post-hoc scaling)
+                eval_test_raw = evaluate_model(
                     model, test_loader,
                     dqa_engine, iri_engine, fusion_engine,
                     corruption_loader, baseline_corr, n_features,
-                    device=device, use_real_dti=use_real_dti, label=m_type,
+                    device=device, use_real_dti=use_real_dti, label=f"{m_type} raw",
+                    missing_rate_sampler=test_sampler,
+                    sigma_scale=1.0,
+                )
+
+                # Scaled evaluation on test set (with fit_validation_sigma_scale)
+                eval_test_scaled = evaluate_model(
+                    model, test_loader,
+                    dqa_engine, iri_engine, fusion_engine,
+                    corruption_loader, baseline_corr, n_features,
+                    device=device, use_real_dti=use_real_dti, label=f"{m_type} scaled",
                     missing_rate_sampler=test_sampler,
                     sigma_scale=sigma_scale,
                 )
@@ -335,8 +345,11 @@ def main(args: argparse.Namespace) -> None:
                     "spiked_3x": spiked_3x,
                     "epochs_trained": epochs_trained,
                     "early_stopped": early_stopped,
-                    "final_ece": float(eval_test["mean_ece"]),
-                    "final_crps": float(eval_test["brier_score"]),
+                    "best_epoch": history.get("best_epoch", 1),
+                    "ece_raw": float(eval_test_raw["mean_ece"]),
+                    "crps_raw": float(eval_test_raw["brier_score"]),
+                    "ece_scaled": float(eval_test_scaled["mean_ece"]),
+                    "crps_scaled": float(eval_test_scaled["brier_score"]),
                     "sigma_scale": sigma_scale,
                 }])
 
@@ -350,34 +363,38 @@ def main(args: argparse.Namespace) -> None:
     # Calculate Aggregated Stats
     aggregated = []
     for (mult, m_type), group in df.groupby(["sigma_lr_multiplier", "model"]):
-        ece_vals = group["final_ece"].values
-        crps_vals = group["final_crps"].values
+        ece_raw_vals = group["ece_raw"].values
+        ece_scaled_vals = group["ece_scaled"].values
+        crps_raw_vals = group["crps_raw"].values
+        crps_scaled_vals = group["crps_scaled"].values
         cv_vals = group["val_loss_stability_cv"].values
         scale_vals = group["sigma_scale"].values
-        
-        ece_range = float(np.max(ece_vals) - np.min(ece_vals))
+        best_epochs = group["best_epoch"].values
         
         aggregated.append({
             "sigma_lr_multiplier": mult,
             "model": m_type,
             "mean_cv": float(np.mean(cv_vals)),
-            "std_cv": float(np.std(cv_vals)),
-            "mean_ece": float(np.mean(ece_vals)),
-            "std_ece": float(np.std(ece_vals)),
-            "ece_range": ece_range,
-            "mean_crps": float(np.mean(crps_vals)),
-            "std_crps": float(np.std(crps_vals)),
-            "mean_scale": float(np.mean(scale_vals)),
-            "std_scale": float(np.std(scale_vals)),
+            "mean_ece_raw": float(np.mean(ece_raw_vals)),
+            "range_ece_raw": float(np.max(ece_raw_vals) - np.min(ece_raw_vals)),
+            "mean_crps_raw": float(np.mean(crps_raw_vals)),
+            "mean_ece_scaled": float(np.mean(ece_scaled_vals)),
+            "range_ece_scaled": float(np.max(ece_scaled_vals) - np.min(ece_scaled_vals)),
+            "mean_crps_scaled": float(np.mean(crps_scaled_vals)),
+            "mean_sigma_scale": float(np.mean(scale_vals)),
+            "mean_best_epoch": float(np.mean(best_epochs)),
         })
 
     df_agg = pd.DataFrame(aggregated)
 
     # Print Summary Markdown Table
-    print("\n" + "=" * 120)
-    print("  AGGERGATED SIGMA LR DECOUPLING ABLATION RESULTS")
-    print("=" * 120)
-    cols = ["sigma_lr_multiplier", "model", "mean_cv", "mean_ece", "ece_range", "mean_crps", "mean_scale"]
+    print("\n" + "=" * 140)
+    print("  AGGREGATED SIGMA LR DECOUPLING ABLATION RESULTS")
+    print("=" * 140)
+    cols = ["sigma_lr_multiplier", "model", "mean_cv",
+            "mean_ece_raw", "range_ece_raw", "mean_crps_raw",
+            "mean_ece_scaled", "range_ece_scaled", "mean_crps_scaled",
+            "mean_sigma_scale", "mean_best_epoch"]
     header = " | ".join(cols)
     sep = " | ".join(["---"] * len(cols))
     print(f"| {header} |")
@@ -388,50 +405,84 @@ def main(args: argparse.Namespace) -> None:
             for c in cols
         )
         print(f"| {row_str} |")
-    print("=" * 120)
+    print("=" * 140)
 
-    # Direct Interpretation logic
-    cali_10 = df_agg[(df_agg["sigma_lr_multiplier"] == 1.0) & (df_agg["model"] == "CALI-PRED")].iloc[0]
-    cali_25 = df_agg[(df_agg["sigma_lr_multiplier"] == 2.5) & (df_agg["model"] == "CALI-PRED")].iloc[0]
+    # Print per-seed detail table
+    print("\n" + "-" * 100)
+    print("  PER-SEED DETAILS")
+    print("-" * 100)
+    detail_cols = ["sigma_lr_multiplier", "model", "seed", "best_epoch",
+                   "ece_raw", "ece_scaled", "sigma_scale", "val_loss_stability_cv"]
+    print("| " + " | ".join(detail_cols) + " |")
+    print("| " + " | ".join(["---"] * len(detail_cols)) + " |")
+    for _, row in df.iterrows():
+        row_str = " | ".join(
+            f"{row[c]:.4f}" if isinstance(row[c], float) else str(row[c])
+            for c in detail_cols
+        )
+        print(f"| {row_str} |")
+    print("-" * 100)
 
-    cv_drop = (cali_25["mean_cv"] - cali_10["mean_cv"]) / (cali_25["mean_cv"] + 1e-8)
-    range_drop = (cali_25["ece_range"] - cali_10["ece_range"]) / (cali_25["ece_range"] + 1e-8)
+    # Revised Interpretation logic
+    n_seeds = df["seed"].nunique()
+
+    cali_10 = df_agg[(df_agg["sigma_lr_multiplier"] == 1.0) & (df_agg["model"] == "CALI-PRED")]
+    cali_25 = df_agg[(df_agg["sigma_lr_multiplier"] == 2.5) & (df_agg["model"] == "CALI-PRED")]
 
     print("\n" + "=" * 80)
     print("  INTERPRETATION SUMMARY")
     print("=" * 80)
-    if cv_drop >= 0.50 and range_drop >= 0.50:
-        print(
-            "[CONFIRMED] The decoupled sigma learning rate is a primary driver "
-            "of both training instability and seed-to-seed result variance. "
-            "Recommend adopting sigma_lr_multiplier=1.0 (or a smaller value like "
-            "1.5) as the new default, and re-running the full multi-seed "
-            "benchmark before finalizing paper results."
-        )
-    else:
-        print(
-            "[NOT CONFIRMED] Instability persists even without the sigma LR decoupling. "
-            "The root cause is elsewhere -- investigate the cosine annealing schedule's "
-            "interaction with the NLL loss's log(sigma^2) term, the sigma_floor value in "
-            "CaliPredTransformer, gradient clipping threshold, or whether "
-            "TrustCalibratedLoss's calibration_weight is contributing (see the prior "
-            "calibration_weight ablation)."
-        )
 
-    # Check Baseline vs CALI-PRED
-    base_25 = df_agg[(df_agg["sigma_lr_multiplier"] == 2.5) & (df_agg["model"] == "Baseline")].iloc[0]
-    if base_25["std_ece"] < cali_25["std_ece"] * 0.5:
-        print(
-            "\nNote: Baseline (DTI=1.0) shows substantially less variance than CALI-PRED "
-            "at the 2.5x multiplier. This suggests an interaction between the sigma LR "
-            "and the DTI trust-inflation mechanism specifically, not a general "
-            "sigma-head training issue."
-        )
-    else:
-        print(
-            "\nNote: Baseline and CALI-PRED exhibit similar variance levels at 2.5x, "
-            "pointing to a general issue with the sigma-head learning rate itself."
-        )
+    # Stability conclusion (this was the valid finding)
+    if len(cali_10) > 0 and len(cali_25) > 0:
+        cv_10 = cali_10.iloc[0]["mean_cv"]
+        cv_25 = cali_25.iloc[0]["mean_cv"]
+        cv_drop = (cv_25 - cv_10) / (cv_25 + 1e-8)
+
+        if cv_drop >= 0.50:
+            print(
+                "[STABILITY] The decoupled sigma learning rate is a primary driver "
+                "of training instability. Setting multiplier=1.0 substantially reduces "
+                "validation loss volatility."
+            )
+        else:
+            print(
+                "[STABILITY] Instability persists even at multiplier=1.0 "
+                f"(CV: {cv_10:.4f} at 1.0x vs {cv_25:.4f} at 2.5x). "
+                "The decoupled LR is a contributor but NOT the root cause. "
+                "Investigate: cosine annealing + NLL log(sigma^2) interaction, "
+                "sigma_floor, gradient clipping threshold, calibration_weight."
+            )
+
+    # ECE/CRPS conclusion (with proper caveats)
+    if len(cali_10) > 0 and len(cali_25) > 0:
+        range_10 = cali_10.iloc[0]["range_ece_raw"]
+        range_25 = cali_25.iloc[0]["range_ece_raw"]
+        mean_scale = df["sigma_scale"].mean()
+
+        print()
+        if n_seeds <= 2:
+            print(
+                f"[ECE/CRPS] INCONCLUSIVE with n={n_seeds} seeds. "
+                "Cannot distinguish real effect from seed-level noise. "
+                "Need n>=5 seeds for reliable ECE/CRPS comparison."
+            )
+        if range_25 > range_10 * 1.2:
+            print(
+                f"[REPRODUCIBILITY] Seed-to-seed ECE range is WIDER at 2.5x "
+                f"(raw: {range_25:.4f}) than at 1.0x (raw: {range_10:.4f}). "
+                "A lower mean ECE with wider range is NOT evidence of improvement."
+            )
+        if mean_scale > 2.0:
+            print(
+                f"[SIGMA SCALE WARNING] Mean post-hoc sigma scale = {mean_scale:.2f}x. "
+                "The model's raw sigma predictions are systematically mis-calibrated "
+                "by this factor. The 'scaled' ECE/CRPS values are distorted by this "
+                "post-hoc correction. The 'raw' values reflect the model's actual "
+                "learned uncertainty. Investigate why sigma is off by ~{:.0f}x before "
+                "trusting absolute calibration numbers.".format(mean_scale)
+            )
+
     print("=" * 80)
 
     # Plot loss curves in a 2x2 grid (Seeds x Multipliers)
