@@ -320,6 +320,7 @@ def train_model(
     use_real_dti: bool = True,
     missing_rate_sampler: Optional[Callable[[], float]] = None,
     sigma_lr_multiplier: float = 2.5,
+    val_warmup_epochs: int = 3,
 ) -> dict:
     """
     Real DataLoader-based training loop with:
@@ -540,26 +541,44 @@ def train_model(
         )
 
         # --- Early stopping + checkpointing (EMA-smoothed) ---------------- #
-        if ema_val_loss < best_val_loss:
-            best_val_loss = ema_val_loss
-            history["best_epoch"] = epoch + 1
-            patience_counter = 0
-            ckpt_path = os.path.join(
-                checkpoint_dir,
-                f"best_model_{'calipred' if use_real_dti else 'baseline'}.pt",
-            )
-            torch.save({
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": best_val_loss,
-            }, ckpt_path)
-            logger.info("  Saved best checkpoint (ema_val=%.4f) → '%s'", best_val_loss, ckpt_path)
+        if (epoch + 1) <= val_warmup_epochs:
+            logger.info("  Warmup epoch %d/%d: checkpointing & early stopping disabled.", epoch + 1, val_warmup_epochs)
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                logger.info("  Early stopping at epoch %d (patience=%d).", epoch + 1, patience)
-                break
+            if ema_val_loss < best_val_loss:
+                best_val_loss = ema_val_loss
+                history["best_epoch"] = epoch + 1
+                patience_counter = 0
+                ckpt_path = os.path.join(
+                    checkpoint_dir,
+                    f"best_model_{'calipred' if use_real_dti else 'baseline'}.pt",
+                )
+                torch.save({
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": best_val_loss,
+                }, ckpt_path)
+                logger.info("  Saved best checkpoint (ema_val=%.4f) → '%s'", best_val_loss, ckpt_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    logger.info("  Early stopping at epoch %d (patience=%d).", epoch + 1, patience)
+                    break
+
+    if history["best_epoch"] == 0:
+        history["best_epoch"] = epochs
+        best_val_loss = ema_val_loss if ema_val_loss is not None else float("inf")
+        ckpt_path = os.path.join(
+            checkpoint_dir,
+            f"best_model_{'calipred' if use_real_dti else 'baseline'}.pt",
+        )
+        torch.save({
+            "epoch": epochs,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": best_val_loss,
+        }, ckpt_path)
+        logger.info("  No checkpoint saved during warmup; saved final epoch %d as fallback checkpoint → '%s'", epochs, ckpt_path)
 
     return history
 
@@ -579,6 +598,7 @@ def evaluate_model(
     device: torch.device = torch.device("cpu"),
     use_real_dti: bool = True,
     label: str = "CALI-PRED",
+    split_name: str = "Test",
     missing_rate: float = 0.15,
     missing_rate_sampler: Optional[Callable[[], float]] = None,
     sigma_scale: float = 1.0,
@@ -684,8 +704,8 @@ def evaluate_model(
     ])
 
     logger.info(
-        "[%s] Test set: ECE=%.4f, Brier(CRPS)=%.4f, N_samples=%d",
-        label, mean_ece, brier, len(y_flat),
+        "[%s] %s set: ECE=%.4f, Brier(CRPS)=%.4f, N_samples=%d",
+        label, split_name, mean_ece, brier, len(y_flat),
     )
 
     return {
@@ -887,6 +907,7 @@ def main(args: argparse.Namespace) -> None:
         use_real_dti=True,
         missing_rate_sampler=train_val_sampler,
         sigma_lr_multiplier=args.sigma_lr_multiplier,
+        val_warmup_epochs=args.val_warmup_epochs,
     )
 
     # ------------------------------------------------------------------ #
@@ -927,6 +948,7 @@ def main(args: argparse.Namespace) -> None:
         use_real_dti=False,
         missing_rate_sampler=train_val_sampler,
         sigma_lr_multiplier=args.sigma_lr_multiplier,
+        val_warmup_epochs=args.val_warmup_epochs,
     )
 
     # ------------------------------------------------------------------ #
@@ -959,6 +981,7 @@ def main(args: argparse.Namespace) -> None:
         dqa_engine, iri_engine, fusion_engine,
         corruption_loader, baseline_corr, n_features,
         device=device, use_real_dti=True, label="CALI-PRED validation",
+        split_name="Validation",
         missing_rate_sampler=train_val_sampler,
     )
     val_results_baseline = evaluate_model(
@@ -966,6 +989,7 @@ def main(args: argparse.Namespace) -> None:
         dqa_engine, iri_engine, fusion_engine,
         corruption_loader, baseline_corr, n_features,
         device=device, use_real_dti=False, label="Baseline validation",
+        split_name="Validation",
         missing_rate_sampler=train_val_sampler,
     )
     calipred_sigma_scale = fit_validation_sigma_scale(
@@ -989,6 +1013,7 @@ def main(args: argparse.Namespace) -> None:
         dqa_engine, iri_engine, fusion_engine,
         corruption_loader, baseline_corr, n_features,
         device=device, use_real_dti=True, label="CALI-PRED",
+        split_name="Test",
         missing_rate_sampler=test_sampler,
         sigma_scale=calipred_sigma_scale if args.apply_validation_sigma_scaling else 1.0,
     )
@@ -997,6 +1022,7 @@ def main(args: argparse.Namespace) -> None:
         dqa_engine, iri_engine, fusion_engine,
         corruption_loader, baseline_corr, n_features,
         device=device, use_real_dti=False, label="Baseline",
+        split_name="Test",
         missing_rate_sampler=test_sampler,
         sigma_scale=baseline_sigma_scale if args.apply_validation_sigma_scaling else 1.0,
     )
@@ -1145,6 +1171,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sigma-lr-multiplier", type=float, default=2.5,
         help="Multiplier for the learning rate of the sigma head (default: 2.5).",
+    )
+    parser.add_argument(
+        "--val-warmup-epochs", type=int, default=3,
+        help="Number of initial warmup epochs before checkpoint eligibility (default: 3).",
     )
     parser.add_argument(
         "--use-temperature", action="store_true",

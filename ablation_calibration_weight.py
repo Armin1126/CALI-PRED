@@ -161,6 +161,7 @@ def run_ablation(args: argparse.Namespace) -> None:
             n_features=n_features, epochs=args.epochs, lr=args.lr,
             device=device, checkpoint_dir=ckpt_dir, use_real_dti=True,
             missing_rate_sampler=train_val_sampler,
+            val_warmup_epochs=getattr(args, "val_warmup_epochs", 3),
         )
         # Load best and evaluate
         ckpt_path_cali = os.path.join(ckpt_dir, "best_model_calipred.pt")
@@ -202,6 +203,7 @@ def run_ablation(args: argparse.Namespace) -> None:
             n_features=n_features, epochs=args.epochs, lr=args.lr,
             device=device, checkpoint_dir=ckpt_dir, use_real_dti=False,
             missing_rate_sampler=train_val_sampler,
+            val_warmup_epochs=getattr(args, "val_warmup_epochs", 3),
         )
         # Load best and evaluate
         ckpt_path_base = os.path.join(ckpt_dir, "best_model_baseline.pt")
@@ -334,6 +336,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--clean-fraction", type=float, default=0.25)
     parser.add_argument("--max-severity", type=float, default=0.45)
+    parser.add_argument(
+        "--val-warmup-epochs", type=int, default=3,
+        help="Number of initial warmup epochs before checkpoint eligibility (default: 3).",
+    )
 
     args = parser.parse_args()
     run_ablation(args)

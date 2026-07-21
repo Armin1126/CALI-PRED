@@ -256,6 +256,7 @@ def main(args: argparse.Namespace) -> None:
                     device=device, checkpoint_dir=ckpt_sub_dir, use_real_dti=use_real_dti,
                     missing_rate_sampler=train_val_sampler,
                     sigma_lr_multiplier=mult,
+                    val_warmup_epochs=getattr(args, "val_warmup_epochs", 3),
                 )
 
                 # Keep track of val_loss history for plots
@@ -288,6 +289,7 @@ def main(args: argparse.Namespace) -> None:
                     dqa_engine, iri_engine, fusion_engine,
                     corruption_loader, baseline_corr, n_features,
                     device=device, use_real_dti=use_real_dti, label=f"{m_type} val",
+                    split_name="Validation",
                     missing_rate_sampler=train_val_sampler,
                 )
                 try:
@@ -303,6 +305,7 @@ def main(args: argparse.Namespace) -> None:
                     dqa_engine, iri_engine, fusion_engine,
                     corruption_loader, baseline_corr, n_features,
                     device=device, use_real_dti=use_real_dti, label=f"{m_type} raw",
+                    split_name="Test",
                     missing_rate_sampler=test_sampler,
                     sigma_scale=1.0,
                 )
@@ -313,6 +316,7 @@ def main(args: argparse.Namespace) -> None:
                     dqa_engine, iri_engine, fusion_engine,
                     corruption_loader, baseline_corr, n_features,
                     device=device, use_real_dti=use_real_dti, label=f"{m_type} scaled",
+                    split_name="Test",
                     missing_rate_sampler=test_sampler,
                     sigma_scale=sigma_scale,
                 )
@@ -538,6 +542,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save-interval-minutes", type=float, default=5.0,
         help="Minutes between periodic checkpoints zips back to Google Drive (default: 5.0).",
+    )
+    parser.add_argument(
+        "--val-warmup-epochs", type=int, default=3,
+        help="Number of initial warmup epochs before checkpoint eligibility (default: 3).",
     )
     parser.add_argument("--max-windows", type=int, default=None)
 
