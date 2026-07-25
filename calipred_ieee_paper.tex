@@ -181,29 +181,29 @@ $m$ & Model & ECE ($\downarrow$) & CRPS ($\downarrow$) \\
 Increasing the multiplier from $m=1.0$ to $m=2.5$ reduces CALI-PRED's ECE by 22.2\% (0.0751$\to$0.0584), while the Baseline shows a comparable but smaller reduction (0.0607$\to$0.0573). The decoupled learning rate disproportionately benefits CALI-PRED because its DTI-conditioned sigma inflation mechanism requires more gradient bandwidth to learn the trust--uncertainty mapping. The validation loss curves (Fig.~\ref{fig:sigma_ablation}) confirm that $m=2.5$ achieves faster convergence across both seeds.
 
 \subsubsection{Ablation Study: Calibration Loss Weight ($\lambda$)}
-Table~\ref{tab:ablation_cw} evaluates the impact of the calibration loss weight $\lambda$ on model performance.
+Table~\ref{tab:ablation_cw} evaluates the impact of the calibration loss weight $\lambda \in \{0.0, 0.1, 0.2\}$ on model calibration and interval coverage.
 
 \begin{table}[htbp]
 \centering
-\caption{Calibration Weight ($\lambda$) Ablation}
+\caption{Calibration Weight ($\lambda$) Ablation (ECE / CRPS / 50\% Gap)}
 \label{tab:ablation_cw}
-\begin{tabular}{clcc}
+\begin{tabular}{clccc}
 \toprule
-$\lambda$ & Model & ECE ($\downarrow$) & CRPS ($\downarrow$) \\
+$\lambda$ & Model & ECE ($\downarrow$) & CRPS ($\downarrow$) & Cov. Gap @ 50\% \\
 \midrule
-\multirow{2}{*}{0.0} & CALI-PRED & 0.1207 & 0.1939 \\
-                      & Baseline  & 0.1075 & 0.1894 \\
+\multirow{2}{*}{0.0} & CALI-PRED & 0.0668 & \textbf{0.5135} & $+$0.1283 \\
+                      & Baseline  & 0.0675 & 0.5561 & $-$0.0141 \\
 \midrule
-\multirow{2}{*}{0.1} & CALI-PRED & 0.1206 & 0.1856 \\
-                      & Baseline  & 0.1102 & 0.1955 \\
+\multirow{2}{*}{0.1} & CALI-PRED & 0.0777 & 0.5390 & $+$0.1203 \\
+                      & Baseline  & 0.1259 & 0.5366 & $-$0.0157 \\
 \midrule
-\multirow{2}{*}{0.2} & CALI-PRED & \textbf{0.0959} & 0.1931 \\
-                      & Baseline  & 0.1088 & 0.1878 \\
+\multirow{2}{*}{0.2} & CALI-PRED & \textbf{0.0497} & 0.5601 & \textbf{$+$0.0578} \\
+                      & Baseline  & 0.1475 & 0.5599 & $-$0.0648 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Without calibration loss ($\lambda = 0$), CALI-PRED's ECE is worse than Baseline, indicating that the DTI-conditioned uncertainty inflation mechanism alone is insufficient without explicit calibration training signal. At $\lambda = 0.2$, CALI-PRED achieves its best ECE (0.0959) and for the first time outperforms Baseline (0.1088) on ECE, a relative improvement of 11.9\%. This confirms the necessity of the pinball calibration loss for the framework's effectiveness.
+Increasing the calibration loss weight $\lambda$ from 0.0 to 0.2 produces CALI-PRED's lowest ECE of \textbf{0.0497}, outperforming the Baseline (0.1475) by 66.3\%. Furthermore, setting $\lambda = 0.2$ reduces CALI-PRED's 50\% nominal coverage gap from $+$0.1283 down to $+$0.0578 (a 54.9\% reduction in over-coverage gap). In contrast, the Baseline's calibration severely degrades to $\text{ECE}=0.1475$ under higher calibration loss weighting due to its inability to dynamically condition uncertainty on input data quality. This confirms the critical role of the pinball loss term in constraining CALI-PRED's trust-inflated prediction intervals.
 
 \subsubsection{Inference Latency Profile}
 To verify that the model can be deployed on resource-constrained edge gateways, we measure the latency of each processing stage on a standard CPU (Table~\ref{tab:latency}).
