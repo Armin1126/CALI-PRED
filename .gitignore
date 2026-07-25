@@ -29,3 +29,8 @@ venv.bak/
 .vscode/
 .idea/
 .gemini/
+
+# LaTeX and Word Reports
+*.tex
+*.docx
+
