@@ -133,7 +133,7 @@ Nominal & Base Cov. & Base Gap & Cali Cov. & Cali Gap \\
 \end{tabular}
 \end{table}
 
-Both models under-cover at higher confidence levels, which is common for heteroscedastic neural networks. However, CALI-PRED's coverage gaps are consistently $\sim$40\% smaller than Baseline's. Notably, CALI-PRED achieves near-perfect calibration at the 50\% and 60\% levels.
+Both models exhibit under-coverage at higher nominal confidence levels ($\ge 0.70$), a well-documented behavior of heteroscedastic neural network uncertainty heads. However, CALI-PRED \emph{substantially reduces dangerous under-coverage} compared to the Baseline model. Across all levels, CALI-PRED's coverage gaps are consistently $\sim$40\% smaller than Baseline's, bringing empirical coverage significantly closer to the nominal calibration diagonal. Notably, at the 50\% and 60\% nominal levels, CALI-PRED achieves near-perfect empirical coverage (52.08\% and 60.11\%, respectively).
 
 \subsubsection{DTI-Binned Calibration Breakdown}
 To verify that CALI-PRED's advantage is strongest when data trust is low, Table~\ref{tab:dti_binned} presents calibration metrics broken down by quantile-binned DTI ranges.
@@ -156,7 +156,7 @@ Center & & (C$-$B) & (C$-$B) \\
 \end{tabular}
 \end{table}
 
-CALI-PRED improves ECE in 4 out of 5 DTI bins, with the largest improvement at the lowest-trust bin (DTI$\approx$0.41, $\Delta$ECE $= -0.032$)---precisely the regime the framework targets. CRPS improves across \emph{all 5 bins}. The slight ECE regression at the highest-trust bin (DTI$\approx$0.81, $\Delta$ECE $= +0.021$) reflects minor base sigma head miscalibration on clean data, but is outweighed by the substantial gains in degraded-trust regimes.
+CALI-PRED improves ECE in 4 out of 5 DTI bins, with the largest improvement occurring at the lowest-trust bin (DTI$\approx$0.41, $\Delta$ECE $= -0.0319$)---precisely the degraded-sensor regime the framework targets. Continuous Ranked Probability Score (CRPS) improves across \emph{all 5 bins}. The slight ECE reversal at the highest-trust bin (DTI$\approx$0.81, $\Delta$ECE $= +0.0213$) indicates a minor calibration trade-off on clean data due to base heteroscedastic sigma head parameterization, but this is far outweighed by the universal CRPS improvement and significant ECE reductions in degraded-trust regimes.
 
 \subsubsection{Ablation Study: Sigma Head Learning Rate Multiplier}
 The sigma head uses a decoupled learning rate $\eta_{\sigma} = m \cdot \eta_{\text{base}}$ to allow faster convergence of uncertainty estimates without destabilizing the mean prediction head. Table~\ref{tab:ablation_sigma} compares $m \in \{1.0, 2.5\}$ across two seeds on a reduced training set (1{,}000 windows, 4 best-checkpoint epochs).
@@ -241,7 +241,7 @@ Fig.~\ref{fig:hero} presents a qualitative comparison of prediction intervals du
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=\columnwidth]{checkpoints/coverage_diagnostics.png}
-\caption{Left: Reliability curves by DTI bin showing CALI-PRED (solid) tracking the calibration diagonal more closely than Baseline (dashed). Right: ECE and CRPS deltas by DTI bin---negative CRPS bars in all bins confirm universal improvement.}
+\caption{Left: Reliability curves by DTI quantile bin showing CALI-PRED (solid) tracking the calibration diagonal significantly closer than Baseline (dashed). Note: Baseline is DTI-blind and evaluated at nominal DTI=1.0 for bookkeeping. Right: ECE and CRPS deltas by DTI bin---negative CRPS bars in all 5 bins confirm universal distribution accuracy improvement.}
 \label{fig:coverage}
 \end{figure}
 
