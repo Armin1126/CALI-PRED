@@ -38,6 +38,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("CaliPredPipeline")
 
+# Mute verbose logs from intermediate engines to avoid Colab console truncation and speed up runs
+logging.getLogger("ImputationReliabilityEngine").setLevel(logging.WARNING)
+logging.getLogger("TrustFusionEngine").setLevel(logging.WARNING)
+logging.getLogger("UpstreamDQAEngine").setLevel(logging.WARNING)
+logging.getLogger("IndustrialDataLoader").setLevel(logging.WARNING)
+
 # Local imports
 from data_loader import (
     IndustrialDataLoader,
