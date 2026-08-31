@@ -48,6 +48,45 @@ from metrics_engine import expected_calibration_curve, calculate_brier_score
 # ------------------------------------------------------------------ #
 # Bootstrap CI computation
 # ------------------------------------------------------------------ #
+def _precompute_window_metrics(
+    y_true: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    nominal_levels: Sequence[float] = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95),
+    window_size: int = 60,
+    n_features: int = 15,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Precompute per-window coverage and CRPS arrays for fast vector bootstrap."""
+    from scipy.stats import norm
+    import math
+
+    block_size = window_size * n_features
+    N = len(y_true)
+    N_windows = N // block_size
+
+    y_t = y_true[:N_windows * block_size].reshape(N_windows, block_size)
+    m = mu[:N_windows * block_size].reshape(N_windows, block_size)
+    s = np.maximum(sigma[:N_windows * block_size].reshape(N_windows, block_size), 1e-8)
+
+    # 1. Coverage per window per nominal level: shape (N_windows, L)
+    abs_res = np.abs(y_t - m)
+    L = len(nominal_levels)
+    window_cov = np.empty((N_windows, L), dtype=np.float64)
+    for i, lvl in enumerate(nominal_levels):
+        z = norm.ppf(0.5 + lvl / 2.0)
+        within = (abs_res <= z * s).astype(np.float64)
+        window_cov[:, i] = np.mean(within, axis=1)
+
+    # 2. Continuous Ranked Probability Score (CRPS) per window: shape (N_windows,)
+    z_std = (y_t - m) / s
+    phi = norm.pdf(z_std)
+    Phi = norm.cdf(z_std)
+    crps_elem = s * (z_std * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
+    window_crps = np.mean(crps_elem, axis=1)
+
+    return window_cov, window_crps
+
+
 def bootstrap_metric(
     y_true: np.ndarray,
     mu: np.ndarray,
@@ -58,75 +97,36 @@ def bootstrap_metric(
     rng: Optional[np.random.Generator] = None,
     window_size: int = 60,
     n_features: int = 15,
+    nominal_levels: Sequence[float] = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95),
 ) -> dict:
-    """
-    Compute bootstrap confidence intervals for a calibration metric.
-
-    Parameters
-    ----------
-    y_true, mu, sigma : np.ndarray, shape (N,)
-        Ground truth, predicted mean, predicted std.
-    metric_fn : str
-        One of "ece" or "crps".
-    n_bootstrap : int
-        Number of bootstrap resamples.
-    confidence : float
-        Confidence level for the interval (e.g., 0.95 for 95% CI).
-    window_size : int
-        Size of prediction windows.
-    n_features : int
-        Number of features/channels.
-
-    Returns
-    -------
-    dict with keys: "point_estimate", "mean", "ci_lower", "ci_upper",
-    "std", "all_samples".
-    """
+    """Fast vectorized window-block bootstrap for individual metric."""
     if rng is None:
         rng = np.random.default_rng(42)
 
-    block_size = window_size * n_features
-    N = len(y_true)
-    N_windows = N // block_size
+    nom_arr = np.asarray(nominal_levels, dtype=np.float64)
+    w_cov, w_crps = _precompute_window_metrics(y_true, mu, sigma, nominal_levels, window_size, n_features)
+    N_windows = len(w_crps)
 
-    # Reshape arrays to (N_windows, block_size)
-    y_true_reshaped = y_true[:N_windows * block_size].reshape(N_windows, block_size)
-    mu_reshaped = mu[:N_windows * block_size].reshape(N_windows, block_size)
-    sigma_reshaped = sigma[:N_windows * block_size].reshape(N_windows, block_size)
+    # Draw all bootstrap resamples in one fast vectorized batch
+    idx_matrix = rng.integers(0, N_windows, size=(n_bootstrap, N_windows))
 
-    samples = np.empty(n_bootstrap)
-
-    for b in range(n_bootstrap):
-        # Draw window indices with replacement (block bootstrap)
-        idx = rng.integers(0, N_windows, size=N_windows)
-        y_b = y_true_reshaped[idx].flatten()
-        mu_b = mu_reshaped[idx].flatten()
-        sigma_b = sigma_reshaped[idx].flatten()
-
-        # Guard against degenerate bootstrap samples
-        if np.any(sigma_b <= 0):
-            sigma_b = np.maximum(sigma_b, 1e-8)
-
-        if metric_fn == "ece":
-            _, _, ece = expected_calibration_curve(y_b, mu_b, sigma_b)
-            samples[b] = ece
-        elif metric_fn == "crps":
-            samples[b] = calculate_brier_score(y_b, mu_b, sigma_b)
-        else:
-            raise ValueError(f"Unknown metric_fn: {metric_fn}")
+    if metric_fn == "ece":
+        # shape: (n_bootstrap, L)
+        boot_cov = np.mean(w_cov[idx_matrix], axis=1)
+        samples = np.mean(np.abs(boot_cov - nom_arr), axis=1)
+        point = float(np.mean(np.abs(np.mean(w_cov, axis=0) - nom_arr)))
+    elif metric_fn == "crps":
+        samples = np.mean(w_crps[idx_matrix], axis=1)
+        point = float(np.mean(w_crps))
+    else:
+        raise ValueError(f"Unknown metric_fn: {metric_fn}")
 
     alpha = 1.0 - confidence
     ci_lower = float(np.percentile(samples, 100 * alpha / 2))
     ci_upper = float(np.percentile(samples, 100 * (1 - alpha / 2)))
 
-    # Point estimate on full data
-    if metric_fn == "ece":
-        _, _, point = expected_calibration_curve(y_true, mu, sigma)
-    else:
-        point = calculate_brier_score(y_true, mu, sigma)
-
     return {
-        "point_estimate": float(point),
+        "point_estimate": point,
         "mean": float(np.mean(samples)),
         "ci_lower": ci_lower,
         "ci_upper": ci_upper,
@@ -145,51 +145,43 @@ def bootstrap_difference(
     rng: Optional[np.random.Generator] = None,
     window_size: int = 60,
     n_features: int = 15,
+    nominal_levels: Sequence[float] = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95),
 ) -> dict:
-    """
-    Bootstrap the *difference* (A - B) in a metric using a window block bootstrap.
-    """
+    """Fast vectorized window-block bootstrap for paired metric difference (A - B)."""
     if rng is None:
         rng = np.random.default_rng(42)
 
-    block_size = window_size * n_features
-    N = len(y_true)
-    N_windows = N // block_size
+    nom_arr = np.asarray(nominal_levels, dtype=np.float64)
+    w_cov_a, w_crps_a = _precompute_window_metrics(y_true, mu_a, sigma_a, nominal_levels, window_size, n_features)
+    w_cov_b, w_crps_b = _precompute_window_metrics(y_true, mu_b, sigma_b, nominal_levels, window_size, n_features)
+    N_windows = len(w_crps_a)
 
-    # Reshape arrays to (N_windows, block_size)
-    y_true_reshaped = y_true[:N_windows * block_size].reshape(N_windows, block_size)
-    mu_a_reshaped = mu_a[:N_windows * block_size].reshape(N_windows, block_size)
-    sigma_a_reshaped = sigma_a[:N_windows * block_size].reshape(N_windows, block_size)
-    mu_b_reshaped = mu_b[:N_windows * block_size].reshape(N_windows, block_size)
-    sigma_b_reshaped = sigma_b[:N_windows * block_size].reshape(N_windows, block_size)
+    idx_matrix = rng.integers(0, N_windows, size=(n_bootstrap, N_windows))
 
-    diffs = np.empty(n_bootstrap)
+    if metric_fn == "ece":
+        boot_cov_a = np.mean(w_cov_a[idx_matrix], axis=1)
+        boot_cov_b = np.mean(w_cov_b[idx_matrix], axis=1)
+        samples_a = np.mean(np.abs(boot_cov_a - nom_arr), axis=1)
+        samples_b = np.mean(np.abs(boot_cov_b - nom_arr), axis=1)
+    elif metric_fn == "crps":
+        samples_a = np.mean(w_crps_a[idx_matrix], axis=1)
+        samples_b = np.mean(w_crps_b[idx_matrix], axis=1)
+    else:
+        raise ValueError(f"Unknown metric_fn: {metric_fn}")
 
-    for b in range(n_bootstrap):
-        # Draw window indices with replacement (block bootstrap)
-        idx = rng.integers(0, N_windows, size=N_windows)
-        y_b = y_true_reshaped[idx].flatten()
-        mu_a_b = mu_a_reshaped[idx].flatten()
-        sigma_a_b = np.maximum(sigma_a_reshaped[idx].flatten(), 1e-8)
-        mu_b_b = mu_b_reshaped[idx].flatten()
-        sigma_b_b = np.maximum(sigma_b_reshaped[idx].flatten(), 1e-8)
-
-        if metric_fn == "ece":
-            _, _, val_a = expected_calibration_curve(y_b, mu_a_b, sigma_a_b)
-            _, _, val_b = expected_calibration_curve(y_b, mu_b_b, sigma_b_b)
-        else:
-            val_a = calculate_brier_score(y_b, mu_a_b, sigma_a_b)
-            val_b = calculate_brier_score(y_b, mu_b_b, sigma_b_b)
-
-        diffs[b] = val_a - val_b
-
+    diffs = samples_a - samples_b
     alpha = 1.0 - confidence
+    ci_lower = float(np.percentile(diffs, 100 * alpha / 2))
+    ci_upper = float(np.percentile(diffs, 100 * (1 - alpha / 2)))
+
     return {
         "mean_diff": float(np.mean(diffs)),
-        "ci_lower": float(np.percentile(diffs, 100 * alpha / 2)),
-        "ci_upper": float(np.percentile(diffs, 100 * (1 - alpha / 2))),
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "std": float(np.std(diffs)),
         "p_positive": float(np.mean(diffs > 0)),
         "p_negative": float(np.mean(diffs < 0)),
+        "all_diffs": diffs,
     }
 
 
