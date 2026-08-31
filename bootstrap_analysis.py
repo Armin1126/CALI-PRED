@@ -31,7 +31,6 @@ import os
 from typing import Optional, Sequence
 
 import numpy as np
-from scipy.stats import norm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -290,7 +289,7 @@ def run_severity_sweep(
     from fusion_engine import TrustFusionEngine
     from iri_module import ImputationReliabilityEngine
     from predictor import CaliPredTransformer
-    from pipeline import compute_dti_for_batch, evaluate_model
+    from pipeline import evaluate_model
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -479,6 +478,8 @@ if __name__ == "__main__":
                         default=[42, 123, 456, 789, 1337])
     parser.add_argument("--max-windows", type=int, default=200,
                         help="Max test windows for severity sweep (default: 200).")
+    parser.add_argument("--pred-paths", type=str, nargs="+", default=None,
+                        help="Explicit paths to one or more test_predictions.npz files.")
     parser.add_argument("--window-size", type=int, default=60,
                         help="Size of prediction windows (default: 60).")
     parser.add_argument("--n-features", type=int, default=None,
@@ -496,17 +497,58 @@ if __name__ == "__main__":
         else:
             n_feat = 15  # metropt default
 
-    # 1. Bootstrap CI (always runs if predictions exist)
-    pred_path = os.path.join(args.checkpoint_dir, "test_predictions.npz")
-    if os.path.exists(pred_path):
-        bootstrap_results = run_bootstrap_analysis(
-            pred_path, args.n_bootstrap, args.confidence,
-            window_size=args.window_size, n_features=n_feat,
-        )
+    # 1. Collect prediction paths
+    pred_paths = []
+    if args.pred_paths:
+        pred_paths = args.pred_paths
     else:
-        print(f"[SKIP] No saved predictions at '{pred_path}'.")
-        print("  Run `python pipeline.py` first to generate test predictions.")
-        bootstrap_results = None
+        direct_path = os.path.join(args.checkpoint_dir, "test_predictions.npz")
+        if os.path.exists(direct_path):
+            pred_paths.append(direct_path)
+        else:
+            import glob
+            seed_files = sorted(glob.glob(os.path.join(args.checkpoint_dir, "seed_*", "test_predictions.npz")))
+            pred_paths.extend(seed_files)
+
+    if pred_paths:
+        print(f"\n[INFO] Found {len(pred_paths)} prediction file(s) to analyze.")
+        all_results = {}
+        for p in pred_paths:
+            print(f"\n>>> Running Bootstrap Analysis on: {p}")
+            res = run_bootstrap_analysis(
+                p, args.n_bootstrap, args.confidence,
+                window_size=args.window_size, n_features=n_feat,
+            )
+            all_results[p] = res
+
+        # If multiple files, print a consolidated LaTeX summary
+        if len(pred_paths) > 1:
+            print("\n" + "=" * 70)
+            print("  CONSOLIDATED MULTI-SEED LATEX TABLE SNIPPET")
+            print("=" * 70)
+            print("% Copy and paste into LaTeX:")
+            print("\\begin{table}[h!]")
+            print("\\centering")
+            print("\\begin{tabular}{lcccc}")
+            print("\\toprule")
+            print("Seed & Baseline ECE [95\\% CI] & CALI-PRED ECE [95\\% CI] & Baseline CRPS [95\\% CI] & CALI-PRED CRPS [95\\% CI] \\\\")
+            print("\\midrule")
+            for p, r in all_results.items():
+                s_name = os.path.basename(os.path.dirname(p)) if "seed_" in p else "Overall"
+                b_ece = f"{r['ece']['baseline']['point_estimate']:.4f} [{r['ece']['baseline']['ci_lower']:.4f}, {r['ece']['baseline']['ci_upper']:.4f}]"
+                c_ece = f"{r['ece']['calipred']['point_estimate']:.4f} [{r['ece']['calipred']['ci_lower']:.4f}, {r['ece']['calipred']['ci_upper']:.4f}]"
+                b_crps = f"{r['crps']['baseline']['point_estimate']:.4f} [{r['crps']['baseline']['ci_lower']:.4f}, {r['crps']['baseline']['ci_upper']:.4f}]"
+                c_crps = f"{r['crps']['calipred']['point_estimate']:.4f} [{r['crps']['calipred']['ci_lower']:.4f}, {r['crps']['calipred']['ci_upper']:.4f}]"
+                print(f"{s_name} & {b_ece} & {c_ece} & {b_crps} & {c_crps} \\\\")
+            print("\\bottomrule")
+            print("\\end{tabular}")
+            print("\\caption{Window-block bootstrap 95\\% confidence intervals across multi-seed runs.}")
+            print("\\label{tab:bootstrap_ci}")
+            print("\\end{table}")
+            print("=" * 70)
+    else:
+        print(f"[SKIP] No saved predictions found in '{args.checkpoint_dir}'.")
+        print("  Run `python run_multiseed_pipeline.py` or `pipeline.py` first.")
 
     # 2. Multi-severity sweep (optional)
     if not args.bootstrap_only and args.data_path is not None:
@@ -523,3 +565,4 @@ if __name__ == "__main__":
               "Use --bootstrap-only to skip, or provide --data-path.")
 
     print("\n[OK] Analysis complete.")
+
