@@ -13,7 +13,6 @@ Usage:
 import argparse
 import logging
 import os
-import sys
 import numpy as np
 import pandas as pd
 import torch
@@ -299,7 +298,7 @@ def run_ablation(args: argparse.Namespace) -> None:
         g_base = abs(df[(df["calibration_weight"] == cw) & (df["model"] == "Baseline")]["gap_at_nominal_50"].values[0])
         if g_cali > g_base:
             gaps_larger.append(f"cw={cw:.1f} (Cali={g_cali:.4f} > Base={g_base:.4f})")
-    
+
     if len(gaps_larger) == len(weights_to_test):
         print(f"CALI-PRED's gap is proportionally larger than Baseline's gap at ALL weights tested: {', '.join(gaps_larger)}. "
               "This suggests that the DTI inflation mechanism compounds the already-present systemic issue, rather than "
@@ -343,3 +342,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     run_ablation(args)
+

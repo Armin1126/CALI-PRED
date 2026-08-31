@@ -24,15 +24,12 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import os
 import time
-from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch import Tensor
 
 logging.basicConfig(
@@ -44,7 +41,6 @@ logger = logging.getLogger("CaliPredPipeline")
 # Local imports
 from data_loader import (
     IndustrialDataLoader,
-    RealCorruptionInjector,
     create_dataloaders,
 )
 from dqa_module import UpstreamDQAEngine
@@ -319,16 +315,18 @@ def train_model(
     checkpoint_dir: str = "checkpoints",
     use_real_dti: bool = True,
     missing_rate_sampler: Optional[Callable[[], float]] = None,
-    sigma_lr_multiplier: float = 2.5,
+    sigma_lr_multiplier: float = 0.5,
     val_warmup_epochs: int = 3,
+    sigma_weight_decay: float = 1e-3,
 ) -> dict:
     """
     Real DataLoader-based training loop with:
     - Real DTI computation per batch (or uniform DTI=1.0 for baseline)
     - Cosine annealing LR scheduler
     - Gradient clipping
-    - Validation loss tracking + early stopping
-    - Model checkpointing
+    - Validation MAE tracking + early stopping (decoupled from raw NLL
+      to prevent sigma collapse from gaming the checkpoint criterion)
+    - Model checkpointing on validation MAE
 
     Returns
     -------
@@ -336,25 +334,32 @@ def train_model(
         Training history with keys "train_loss", "val_loss", "best_epoch".
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
-    # Decoupled learning rates for sigma head and trust parameters if multiplier != 1.0
-    if hasattr(model, "sigma_head") and sigma_lr_multiplier != 1.0:
+    # Decoupled learning rates for sigma head and trust parameters.
+    # Default multiplier is 0.5 (slower sigma LR) to prevent the sigma
+    # head from overfitting to shrinking training residuals faster than
+    # the mu head generalizes.  Weight decay on sigma params further
+    # regularizes against extreme weight magnitudes that produce
+    # collapsed sigma values.
+    if hasattr(model, "sigma_head") and (sigma_lr_multiplier != 1.0 or sigma_weight_decay > 0.0):
         sigma_lr_mult = sigma_lr_multiplier
         sigma_params = list(model.sigma_head.parameters())
         if hasattr(model, "sigma_temperature_raw"):
             sigma_params.append(model.sigma_temperature_raw)
         if hasattr(model, "trust_sensitivity_raw"):
             sigma_params.append(model.trust_sensitivity_raw)
-            
+
         sigma_param_ids = {id(p) for p in sigma_params}
         other_params = [p for p in model.parameters() if id(p) not in sigma_param_ids]
-        
+
         optimizer = torch.optim.Adam([
             {"params": other_params, "lr": lr},
-            {"params": sigma_params, "lr": lr * sigma_lr_mult}
+            {"params": sigma_params, "lr": lr * sigma_lr_mult,
+             "weight_decay": sigma_weight_decay}
         ])
         logger.info(
-            "Optimizer: decoupled learning rates. General LR = %.6f, Sigma LR = %.6f (multiplier = %.2f)",
-            lr, lr * sigma_lr_mult, sigma_lr_mult
+            "Optimizer: decoupled learning rates. General LR = %.6f, "
+            "Sigma LR = %.6f (multiplier = %.2f), Sigma WD = %.6f",
+            lr, lr * sigma_lr_mult, sigma_lr_mult, sigma_weight_decay
         )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -364,15 +369,15 @@ def train_model(
     )
 
     history = {
-        "train_loss": [], "val_loss": [], "ema_val_loss": [], "best_epoch": 0,
+        "train_loss": [], "val_loss": [], "best_epoch": 0,
         "train_nll": [], "val_nll": [], "train_pinball": [], "val_pinball": [],
+        "train_nll_log_sigma": [], "val_nll_log_sigma": [],
+        "train_nll_residual": [], "val_nll_residual": [],
         "train_sigma_base": [], "val_sigma_base": [],
         "train_inflation": [], "val_inflation": [], "train_z_rmse": [], "val_z_rmse": [],
         "train_mae": [], "val_mae": [],
     }
-    best_val_loss = float("inf")
-    ema_val_loss = None
-    ema_alpha = 0.3  # EMA smoothing: dampen single-epoch spikes in non-monotonic NLL
+    best_val_mae = float("inf")
     patience = 10
     patience_counter = 0
 
@@ -384,6 +389,7 @@ def train_model(
         model.train()
         epoch_losses = []
         epoch_nlls, epoch_pinballs, epoch_base_sigmas, epoch_inflations, epoch_z_rmses, epoch_maes = [], [], [], [], [], []
+        epoch_nll_log_sigmas, epoch_nll_residuals = [], []
 
         for batch_idx, batch in enumerate(train_loader):
             if len(batch) == 4:
@@ -431,6 +437,8 @@ def train_model(
             epoch_losses.append(loss.item())
             epoch_nlls.append(diagnostics["nll"].item())
             epoch_pinballs.append(diagnostics["calibration"].item())
+            epoch_nll_log_sigmas.append(diagnostics["nll_log_sigma"].item())
+            epoch_nll_residuals.append(diagnostics["nll_residual"].item())
             base_sigma, inflation, z_rmse = batch_uncertainty_diagnostics(
                 model, mu, sigma, target, dti_tensor,
             )
@@ -446,6 +454,8 @@ def train_model(
         history["train_loss"].append(avg_train_loss)
         history["train_nll"].append(float(np.mean(epoch_nlls)))
         history["train_pinball"].append(float(np.mean(epoch_pinballs)))
+        history["train_nll_log_sigma"].append(float(np.mean(epoch_nll_log_sigmas)))
+        history["train_nll_residual"].append(float(np.mean(epoch_nll_residuals)))
         history["train_sigma_base"].append(float(avg_train_sigma_base))
         history["train_inflation"].append(float(avg_train_inflation))
         history["train_z_rmse"].append(float(np.mean(epoch_z_rmses)))
@@ -455,6 +465,7 @@ def train_model(
         model.eval()
         val_losses = []
         val_nlls, val_pinballs, val_base_sigmas, val_inflations, val_z_rmses, val_maes = [], [], [], [], [], []
+        val_nll_log_sigmas, val_nll_residuals = [], []
 
         with torch.no_grad():
             for batch in val_loader:
@@ -497,6 +508,8 @@ def train_model(
                 val_losses.append(loss.item())
                 val_nlls.append(diagnostics["nll"].item())
                 val_pinballs.append(diagnostics["calibration"].item())
+                val_nll_log_sigmas.append(diagnostics["nll_log_sigma"].item())
+                val_nll_residuals.append(diagnostics["nll_residual"].item())
                 base_sigma, inflation, z_rmse = batch_uncertainty_diagnostics(
                     model, mu, sigma, target, dti_tensor,
                 )
@@ -506,20 +519,15 @@ def train_model(
                 val_maes.append(torch.mean(torch.abs(target - mu)).item())
 
         avg_val_loss = np.mean(val_losses) if val_losses else float("inf")
-        avg_val_mae = np.mean(val_maes) if val_maes else 0.0
+        avg_val_mae = np.mean(val_maes) if val_maes else float("inf")
         avg_val_sigma_base = np.mean(val_base_sigmas) if val_base_sigmas else 0.0
         avg_val_inflation = np.mean(val_inflations) if val_inflations else 1.0
 
-        # Update EMA of validation loss for smoothed checkpoint selection
-        if ema_val_loss is None:
-            ema_val_loss = avg_val_loss
-        else:
-            ema_val_loss = ema_alpha * avg_val_loss + (1.0 - ema_alpha) * ema_val_loss
-
         history["val_loss"].append(avg_val_loss)
-        history["ema_val_loss"].append(ema_val_loss)
         history["val_nll"].append(float(np.mean(val_nlls)))
         history["val_pinball"].append(float(np.mean(val_pinballs)))
+        history["val_nll_log_sigma"].append(float(np.mean(val_nll_log_sigmas)))
+        history["val_nll_residual"].append(float(np.mean(val_nll_residuals)))
         history["val_sigma_base"].append(float(avg_val_sigma_base))
         history["val_inflation"].append(float(avg_val_inflation))
         history["val_z_rmse"].append(float(np.mean(val_z_rmses)))
@@ -528,24 +536,30 @@ def train_model(
         # --- Logging ------------------------------------------------------- #
         lr_current = scheduler.get_last_lr()[0]
         logger.info(
-            "[%s] Epoch %02d/%02d | train_loss=%.4f | val_loss=%.4f | ema_val=%.4f | lr=%.6f",
-            model_label, epoch + 1, epochs, avg_train_loss, avg_val_loss, ema_val_loss, lr_current,
+            "[%s] Epoch %02d/%02d | train_loss=%.4f | val_loss=%.4f | val_mae=%.4f | lr=%.6f",
+            model_label, epoch + 1, epochs, avg_train_loss, avg_val_loss, avg_val_mae, lr_current,
         )
         logger.info(
-            "  -> Train: MAE=%.4f | BaseSigma=%.4f | Inflation=%.4f",
-            avg_train_mae, avg_train_sigma_base, avg_train_inflation
+            "  -> Train: MAE=%.4f | BaseSigma=%.4f | Inflation=%.4f | NLL(logσ=%.4f, resid=%.4f)",
+            avg_train_mae, avg_train_sigma_base, avg_train_inflation,
+            history["train_nll_log_sigma"][-1], history["train_nll_residual"][-1],
         )
         logger.info(
-            "  -> Val:   MAE=%.4f | BaseSigma=%.4f | Inflation=%.4f",
-            avg_val_mae, avg_val_sigma_base, avg_val_inflation
+            "  -> Val:   MAE=%.4f | BaseSigma=%.4f | Inflation=%.4f | NLL(logσ=%.4f, resid=%.4f)",
+            avg_val_mae, avg_val_sigma_base, avg_val_inflation,
+            history["val_nll_log_sigma"][-1], history["val_nll_residual"][-1],
         )
 
-        # --- Early stopping + checkpointing (EMA-smoothed) ---------------- #
+        # --- Early stopping + checkpointing on validation MAE ------------- #
+        # Checkpoint on val MAE instead of raw NLL so that a healthy,
+        # non-collapsed sigma doesn't get penalized relative to a
+        # collapsing one that's gaming the NLL loss.  This decouples
+        # mu quality from sigma stability in the checkpoint criterion.
         if (epoch + 1) <= val_warmup_epochs:
             logger.info("  Warmup epoch %d/%d: checkpointing & early stopping disabled.", epoch + 1, val_warmup_epochs)
         else:
-            if ema_val_loss < best_val_loss:
-                best_val_loss = ema_val_loss
+            if avg_val_mae < best_val_mae:
+                best_val_mae = avg_val_mae
                 history["best_epoch"] = epoch + 1
                 patience_counter = 0
                 ckpt_path = os.path.join(
@@ -556,9 +570,10 @@ def train_model(
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": best_val_loss,
+                    "val_mae": best_val_mae,
+                    "val_loss": avg_val_loss,
                 }, ckpt_path)
-                logger.info("  Saved best checkpoint (ema_val=%.4f) → '%s'", best_val_loss, ckpt_path)
+                logger.info("  Saved best checkpoint (val_mae=%.4f) → '%s'", best_val_mae, ckpt_path)
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -567,7 +582,6 @@ def train_model(
 
     if history["best_epoch"] == 0:
         history["best_epoch"] = epochs
-        best_val_loss = ema_val_loss if ema_val_loss is not None else float("inf")
         ckpt_path = os.path.join(
             checkpoint_dir,
             f"best_model_{'calipred' if use_real_dti else 'baseline'}.pt",
@@ -576,7 +590,8 @@ def train_model(
             "epoch": epochs,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "val_loss": best_val_loss,
+            "val_mae": avg_val_mae,
+            "val_loss": avg_val_loss,
         }, ckpt_path)
         logger.info("  No checkpoint saved during warmup; saved final epoch %d as fallback checkpoint → '%s'", epochs, ckpt_path)
 
@@ -882,11 +897,14 @@ def main(args: argparse.Namespace) -> None:
         max_uncertainty_inflation=args.max_inflation,
         alpha_init=args.alpha_init,
         use_temperature=args.use_temperature,
+        sigma_floor=args.sigma_floor,
+        sigma_init_bias=args.sigma_init_bias,
     )
     model_calipred.sigma_lr_multiplier = args.sigma_lr_multiplier
 
     loss_fn = TrustCalibratedLoss(
         lower_q=0.05, upper_q=0.95, calibration_weight=0.2,
+        beta_nll=args.beta_nll,
     )
 
     history_calipred = train_model(
@@ -927,6 +945,8 @@ def main(args: argparse.Namespace) -> None:
         max_uncertainty_inflation=args.max_inflation,
         alpha_init=args.alpha_init,
         use_temperature=args.use_temperature,
+        sigma_floor=args.sigma_floor,
+        sigma_init_bias=args.sigma_init_bias,
     )
     model_baseline.sigma_lr_multiplier = args.sigma_lr_multiplier
 
@@ -1169,8 +1189,9 @@ if __name__ == "__main__":
               "only; intended for the calibration experiment."),
     )
     parser.add_argument(
-        "--sigma-lr-multiplier", type=float, default=2.5,
-        help="Multiplier for the learning rate of the sigma head (default: 2.5).",
+        "--sigma-lr-multiplier", type=float, default=0.5,
+        help="Multiplier for the learning rate of the sigma head (default: 0.5). "
+             "Values < 1.0 slow sigma training to prevent NLL collapse.",
     )
     parser.add_argument(
         "--val-warmup-epochs", type=int, default=3,
@@ -1181,9 +1202,23 @@ if __name__ == "__main__":
         help="Use a global learnable temperature scaling on predicted base sigma.",
     )
     parser.add_argument(
+        "--sigma-floor", type=float, default=0.1,
+        help="Additive floor on base sigma to prevent NLL collapse (default: 0.1).",
+    )
+    parser.add_argument(
+        "--sigma-init-bias", type=float, default=0.5,
+        help="Initial bias for sigma head; softplus(0.5) ~ 1.07 (default: 0.5).",
+    )
+    parser.add_argument(
+        "--beta-nll", type=float, default=0.0,
+        help="Beta-NLL reweighting exponent (Seitzer et al. 2022). "
+             "0.0 = standard NLL, 0.5 = balanced dampening (default: 0.0).",
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for deterministic initialization and splits (default: 42).",
     )
 
     args = parser.parse_args()
     main(args)
+

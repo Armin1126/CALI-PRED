@@ -1,17 +1,21 @@
 """
 ablation_sigma_lr.py
 
-CALI-PRED Study: Ablation study of the decoupled sigma learning rate multiplier
-to evaluate its impact on training/validation stability and seed-to-seed result variance.
+CALI-PRED Study: Ablation study of sigma head stabilization strategies.
+
+Sweeps a grid of:
+  - sigma_lr_multiplier: [0.3, 0.5, 1.0, 2.5]  (slower → faster sigma LR)
+  - sigma_floor:         [0.01, 0.1, 0.2]        (architectural sigma lower bound)
+  - beta_nll:            [0.0]                    (β-NLL reweighting; extend to [0.0, 0.5, 1.0])
+  - seeds:               [42, 456, 789]
 
 Usage:
 ------
     python ablation_sigma_lr.py --data-path "data/metropt/MetroPT3(AirCompressor).csv" --epochs 25
-    python ablation_sigma_lr.py --data-path "data/metropt/MetroPT3(chiller).csv" --epochs 25
+    python ablation_sigma_lr.py --data-path "data/metropt/MetroPT3(AirCompressor).csv" --epochs 25 --beta-nlls 0.0 0.5 1.0
 
-NOTE: If running on Google Colab, make sure to periodically check the drive backup.
-You can specify --save-interval-minutes to automatically back up progress to your
-Google Drive in case of runtime disconnects.
+NOTE: If running on Google Colab, you can specify --save-interval-minutes to
+automatically back up progress to Google Drive in case of runtime disconnects.
 """
 
 import argparse
@@ -25,6 +29,8 @@ import threading
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # Setup logging
@@ -59,9 +65,9 @@ def backup_to_drive_periodically(interval_minutes: float, checkpoint_dir: str):
     """Periodically archives the checkpoints directory to Google Drive if mounted."""
     if interval_minutes <= 0:
         return
-    
+
     drive_backup_dir = "/content/drive/MyDrive/CALI-PRED-Results/ablation_sigma_lr_backup"
-    
+
     def run_backup():
         while True:
             time.sleep(interval_minutes * 60)
@@ -73,7 +79,7 @@ def backup_to_drive_periodically(interval_minutes: float, checkpoint_dir: str):
                     logger.info("[OK] Periodic backup of checkpoints to Google Drive complete.")
                 except Exception as e:
                     logger.warning("[WARNING] Failed to write periodic backup to Google Drive: %s", e)
-    
+
     t = threading.Thread(target=run_backup, daemon=True)
     t.start()
 
@@ -92,7 +98,7 @@ def main(args: argparse.Namespace) -> None:
     logger.info("Ablation study running on device: %s", device)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    # 1. Dataset Safeguards check: immediately load CSV via pandas to verify true MetroPT dataset dimensions
+    # 1. Dataset Safeguards check
     logger.info("Dataset Safeguards: Loading target CSV metadata check...")
     try:
         raw_df = pd.read_csv(args.data_path, nrows=50)
@@ -104,11 +110,20 @@ def main(args: argparse.Namespace) -> None:
     # Start the periodic drive backup thread
     backup_to_drive_periodically(args.save_interval_minutes, args.checkpoint_dir)
 
-    seeds = [42, 456]
-    multipliers = [1.0, 2.5]
+    # Parse grid axes
+    seeds = args.seeds
+    multipliers = args.multipliers
+    sigma_floors = args.sigma_floors
+    beta_nlls = args.beta_nlls
     models = ["CALI-PRED", "Baseline"]
 
-    # Clear previous ablation outputs to ensure fresh starts
+    total_runs = len(seeds) * len(multipliers) * len(sigma_floors) * len(beta_nlls) * len(models)
+    logger.info(
+        "Ablation grid: %d multipliers x %d floors x %d beta_nlls x %d models x %d seeds = %d total runs",
+        len(multipliers), len(sigma_floors), len(beta_nlls), len(models), len(seeds), total_runs
+    )
+
+    # Clear previous ablation outputs
     json_path = os.path.join(args.checkpoint_dir, "sigma_lr_ablation_results.json")
     csv_path = os.path.join(args.checkpoint_dir, "sigma_lr_ablation_summary.csv")
     if os.path.exists(json_path):
@@ -116,12 +131,7 @@ def main(args: argparse.Namespace) -> None:
     if os.path.exists(csv_path):
         os.remove(csv_path)
 
-    # Keep track of loss histories for plotting
-    plot_histories = {}
-
-    print("\n" + "=" * 80)
-    print("Note: ablation runs use reduced epoch count (25 vs 40) for speed; confirm trend holds with full training before finalizing conclusions.")
-    print("=" * 80)
+    run_count = 0
 
     for seed in seeds:
         logger.info("-" * 60)
@@ -139,7 +149,7 @@ def main(args: argparse.Namespace) -> None:
             random_state=seed,
         )
         n_features = train_ds.n_features
-        
+
         # Explicit dataset safeguards check
         if hasattr(train_ds, "X"):
             logger.info("Dataset Safeguards: Raw training matrix shape = %s (channels = %d)", train_ds.X.shape, n_features)
@@ -217,188 +227,219 @@ def main(args: argparse.Namespace) -> None:
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
         test_loader = torch.utils.data.DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
-        # Run models & multipliers
-        for mult in multipliers:
-            for m_type in models:
-                # Enforce a deterministic environment at the beginning of each run
-                torch.manual_seed(seed)
-                np.random.seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
+        # Run grid sweep for this seed
+        for s_floor in sigma_floors:
+            for beta in beta_nlls:
+                for mult in multipliers:
+                    for m_type in models:
+                        run_count += 1
 
-                logger.info(
-                    "[RUN] Running: Model=%s, Multiplier=%.1f, Seed=%d",
-                    m_type, mult, seed
-                )
+                        # Enforce a deterministic environment
+                        torch.manual_seed(seed)
+                        np.random.seed(seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(seed)
 
-                # Output folder for checkpointing
-                ckpt_sub_dir = os.path.join(args.checkpoint_dir, f"ablation_mult_{mult}_seed_{seed}_{m_type.lower()}")
-                os.makedirs(ckpt_sub_dir, exist_ok=True)
+                        logger.info(
+                            "[RUN %d/%d] Model=%s | mult=%.2f | floor=%.3f | beta=%.1f | seed=%d",
+                            run_count, total_runs, m_type, mult, s_floor, beta, seed
+                        )
 
-                # Initialize model
-                model = CaliPredTransformer(
-                    input_dim=n_features, output_dim=n_features,
-                    d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
-                    dropout=0.1, max_uncertainty_inflation=args.max_inflation,
-                    alpha_init=args.alpha_init,
-                )
+                        # Output folder for checkpointing
+                        ckpt_sub_dir = os.path.join(
+                            args.checkpoint_dir,
+                            f"ablation_mult_{mult}_floor_{s_floor}_beta_{beta}_seed_{seed}_{m_type.lower()}"
+                        )
+                        os.makedirs(ckpt_sub_dir, exist_ok=True)
 
-                loss_fn = TrustCalibratedLoss(lower_q=0.05, upper_q=0.95, calibration_weight=0.2)
-                use_real_dti = (m_type == "CALI-PRED")
+                        # Initialize model with this sigma_floor
+                        model = CaliPredTransformer(
+                            input_dim=n_features, output_dim=n_features,
+                            d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
+                            dropout=0.1, max_uncertainty_inflation=args.max_inflation,
+                            alpha_init=args.alpha_init,
+                            sigma_floor=s_floor,
+                            sigma_init_bias=args.sigma_init_bias,
+                        )
 
-                # Train
-                history = train_model(
-                    model=model, loss_fn=loss_fn,
-                    train_loader=train_loader, val_loader=val_loader,
-                    dqa_engine=dqa_engine, iri_engine=iri_engine, fusion_engine=fusion_engine,
-                    corruption_loader=corruption_loader, baseline_corr=baseline_corr,
-                    n_features=n_features, epochs=args.epochs, lr=args.lr,
-                    device=device, checkpoint_dir=ckpt_sub_dir, use_real_dti=use_real_dti,
-                    missing_rate_sampler=train_val_sampler,
-                    sigma_lr_multiplier=mult,
-                    val_warmup_epochs=getattr(args, "val_warmup_epochs", 3),
-                )
+                        loss_fn = TrustCalibratedLoss(
+                            lower_q=0.05, upper_q=0.95, calibration_weight=0.2,
+                            beta_nll=beta,
+                        )
+                        use_real_dti = (m_type == "CALI-PRED")
 
-                # Keep track of val_loss history for plots
-                plot_histories[(mult, seed, m_type)] = history["val_loss"]
+                        # Train
+                        history = train_model(
+                            model=model, loss_fn=loss_fn,
+                            train_loader=train_loader, val_loader=val_loader,
+                            dqa_engine=dqa_engine, iri_engine=iri_engine, fusion_engine=fusion_engine,
+                            corruption_loader=corruption_loader, baseline_corr=baseline_corr,
+                            n_features=n_features, epochs=args.epochs, lr=args.lr,
+                            device=device, checkpoint_dir=ckpt_sub_dir, use_real_dti=use_real_dti,
+                            missing_rate_sampler=train_val_sampler,
+                            sigma_lr_multiplier=mult,
+                            val_warmup_epochs=getattr(args, "val_warmup_epochs", 3),
+                        )
 
-                # Stability metrics
-                val_losses = history["val_loss"]
-                stability_cv = compute_val_loss_stability(val_losses)
-                epochs_trained = len(val_losses)
-                early_stopped = (epochs_trained < args.epochs)
+                        # Stability metrics
+                        val_losses = history["val_loss"]
+                        val_maes = history["val_mae"]
+                        stability_cv = compute_val_loss_stability(val_losses)
+                        mae_stability_cv = compute_val_loss_stability(val_maes)
+                        epochs_trained = len(val_losses)
+                        early_stopped = (epochs_trained < args.epochs)
 
-                # Calculate spiked_3x: check if val_loss ever exceeds 3x its value from 2 epochs prior
-                spiked_3x = False
-                for e in range(2, len(val_losses)):
-                    if val_losses[e] > 3.0 * val_losses[e - 2]:
-                        spiked_3x = True
-                        break
+                        # Load best checkpoint for evaluation
+                        ckpt_name = "best_model_calipred.pt" if use_real_dti else "best_model_baseline.pt"
+                        ckpt_path = os.path.join(ckpt_sub_dir, ckpt_name)
+                        if os.path.exists(ckpt_path):
+                            model.load_state_dict(
+                                torch.load(ckpt_path, map_location=device, weights_only=False)["model_state_dict"]
+                            )
 
-                # Load best checkpoint for evaluation
-                ckpt_name = "best_model_calipred.pt" if use_real_dti else "best_model_baseline.pt"
-                ckpt_path = os.path.join(ckpt_sub_dir, ckpt_name)
-                if os.path.exists(ckpt_path):
-                    model.load_state_dict(
-                        torch.load(ckpt_path, map_location=device, weights_only=False)["model_state_dict"]
-                    )
+                        # Post-hoc validation scaling
+                        val_results = evaluate_model(
+                            model, val_loader,
+                            dqa_engine, iri_engine, fusion_engine,
+                            corruption_loader, baseline_corr, n_features,
+                            device=device, use_real_dti=use_real_dti, label=f"{m_type} val",
+                            split_name="Validation",
+                            missing_rate_sampler=train_val_sampler,
+                        )
+                        try:
+                            sigma_scale = fit_validation_sigma_scale(
+                                val_results["y_true"], val_results["mu"], val_results["sigma"]
+                            )
+                        except Exception:
+                            sigma_scale = 1.0
 
-                # Post-hoc validation scaling
-                val_results = evaluate_model(
-                    model, val_loader,
-                    dqa_engine, iri_engine, fusion_engine,
-                    corruption_loader, baseline_corr, n_features,
-                    device=device, use_real_dti=use_real_dti, label=f"{m_type} val",
-                    split_name="Validation",
-                    missing_rate_sampler=train_val_sampler,
-                )
-                try:
-                    sigma_scale = fit_validation_sigma_scale(
-                        val_results["y_true"], val_results["mu"], val_results["sigma"]
-                    )
-                except Exception:
-                    sigma_scale = 1.0
+                        # Raw evaluation on test set (sigma_scale=1.0)
+                        eval_test_raw = evaluate_model(
+                            model, test_loader,
+                            dqa_engine, iri_engine, fusion_engine,
+                            corruption_loader, baseline_corr, n_features,
+                            device=device, use_real_dti=use_real_dti, label=f"{m_type} raw",
+                            split_name="Test",
+                            missing_rate_sampler=test_sampler,
+                            sigma_scale=1.0,
+                        )
 
-                # Raw evaluation on test set (sigma_scale=1.0, no post-hoc scaling)
-                eval_test_raw = evaluate_model(
-                    model, test_loader,
-                    dqa_engine, iri_engine, fusion_engine,
-                    corruption_loader, baseline_corr, n_features,
-                    device=device, use_real_dti=use_real_dti, label=f"{m_type} raw",
-                    split_name="Test",
-                    missing_rate_sampler=test_sampler,
-                    sigma_scale=1.0,
-                )
+                        # Scaled evaluation on test set
+                        eval_test_scaled = evaluate_model(
+                            model, test_loader,
+                            dqa_engine, iri_engine, fusion_engine,
+                            corruption_loader, baseline_corr, n_features,
+                            device=device, use_real_dti=use_real_dti, label=f"{m_type} scaled",
+                            split_name="Test",
+                            missing_rate_sampler=test_sampler,
+                            sigma_scale=sigma_scale,
+                        )
 
-                # Scaled evaluation on test set (with fit_validation_sigma_scale)
-                eval_test_scaled = evaluate_model(
-                    model, test_loader,
-                    dqa_engine, iri_engine, fusion_engine,
-                    corruption_loader, baseline_corr, n_features,
-                    device=device, use_real_dti=use_real_dti, label=f"{m_type} scaled",
-                    split_name="Test",
-                    missing_rate_sampler=test_sampler,
-                    sigma_scale=sigma_scale,
-                )
+                        # Compute mean raw sigma on test data
+                        mean_raw_sigma = float(np.mean(eval_test_raw["raw_sigma"]))
 
-                # --- Defensive Persistence: Write incrementally to files ---
-                # A. JSON results append
-                try:
-                    with open(json_path, 'r') as f:
-                        json_data = json.load(f)
-                except Exception:
-                    json_data = []
+                        # --- Incremental persistence ---
+                        # A. JSON results append
+                        try:
+                            with open(json_path, 'r') as f:
+                                json_data = json.load(f)
+                        except Exception:
+                            json_data = []
 
-                json_data.append({
-                    "sigma_lr_multiplier": mult,
-                    "model": m_type,
-                    "seed": seed,
-                    "train_loss_curve": history["train_loss"],
-                    "val_loss_curve": history["val_loss"],
-                })
+                        json_data.append({
+                            "sigma_lr_multiplier": mult,
+                            "sigma_floor": s_floor,
+                            "beta_nll": beta,
+                            "model": m_type,
+                            "seed": seed,
+                            "train_loss_curve": history["train_loss"],
+                            "val_loss_curve": history["val_loss"],
+                            "val_mae_curve": history["val_mae"],
+                            "train_sigma_base_curve": history.get("train_sigma_base", []),
+                            "val_sigma_base_curve": history.get("val_sigma_base", []),
+                            "train_nll_log_sigma_curve": history.get("train_nll_log_sigma", []),
+                            "train_nll_residual_curve": history.get("train_nll_residual", []),
+                        })
 
-                with open(json_path, 'w') as f:
-                    json.dump(json_data, f, indent=4)
+                        with open(json_path, 'w') as f:
+                            json.dump(json_data, f, indent=4)
 
-                # B. CSV summary append
-                row_df = pd.DataFrame([{
-                    "sigma_lr_multiplier": mult,
-                    "model": m_type,
-                    "seed": seed,
-                    "val_loss_stability_cv": stability_cv,
-                    "spiked_3x": spiked_3x,
-                    "epochs_trained": epochs_trained,
-                    "early_stopped": early_stopped,
-                    "best_epoch": history.get("best_epoch", 1),
-                    "ece_raw": float(eval_test_raw["mean_ece"]),
-                    "crps_raw": float(eval_test_raw["brier_score"]),
-                    "ece_scaled": float(eval_test_scaled["mean_ece"]),
-                    "crps_scaled": float(eval_test_scaled["brier_score"]),
-                    "sigma_scale": sigma_scale,
-                }])
+                        # B. CSV summary append
+                        row_df = pd.DataFrame([{
+                            "sigma_lr_multiplier": mult,
+                            "sigma_floor": s_floor,
+                            "beta_nll": beta,
+                            "model": m_type,
+                            "seed": seed,
+                            "val_loss_stability_cv": stability_cv,
+                            "mae_stability_cv": mae_stability_cv,
+                            "epochs_trained": epochs_trained,
+                            "early_stopped": early_stopped,
+                            "best_epoch": history.get("best_epoch", 1),
+                            "ece_raw": float(eval_test_raw["mean_ece"]),
+                            "crps_raw": float(eval_test_raw["brier_score"]),
+                            "ece_scaled": float(eval_test_scaled["mean_ece"]),
+                            "crps_scaled": float(eval_test_scaled["brier_score"]),
+                            "sigma_scale": sigma_scale,
+                            "sigma_scale_proximity": abs(sigma_scale - 1.0),
+                            "mean_raw_sigma": mean_raw_sigma,
+                            "final_train_sigma_base": history["train_sigma_base"][-1] if history["train_sigma_base"] else 0.0,
+                            "final_val_sigma_base": history["val_sigma_base"][-1] if history["val_sigma_base"] else 0.0,
+                        }])
 
-                header = not os.path.exists(csv_path)
-                row_df.to_csv(csv_path, mode='a', index=False, header=header)
-                logger.info("Saved incremental results for mult=%.1f, model=%s, seed=%d.", mult, m_type, seed)
+                        header = not os.path.exists(csv_path)
+                        row_df.to_csv(csv_path, mode='a', index=False, header=header)
+                        logger.info(
+                            "  -> Result: ECE_raw=%.4f | CRPS_raw=%.4f | sigma_scale=%.2f | "
+                            "mean_raw_sigma=%.4f | best_epoch=%d",
+                            float(eval_test_raw["mean_ece"]),
+                            float(eval_test_raw["brier_score"]),
+                            sigma_scale,
+                            mean_raw_sigma,
+                            history.get("best_epoch", 1),
+                        )
 
+    # ======================================================================== #
     # 5. Read all results back to construct aggregated stats
+    # ======================================================================== #
     df = pd.read_csv(csv_path)
 
     # Calculate Aggregated Stats
+    group_cols = ["sigma_lr_multiplier", "sigma_floor", "beta_nll", "model"]
     aggregated = []
-    for (mult, m_type), group in df.groupby(["sigma_lr_multiplier", "model"]):
-        ece_raw_vals = group["ece_raw"].values
-        ece_scaled_vals = group["ece_scaled"].values
-        crps_raw_vals = group["crps_raw"].values
-        crps_scaled_vals = group["crps_scaled"].values
-        cv_vals = group["val_loss_stability_cv"].values
-        scale_vals = group["sigma_scale"].values
-        best_epochs = group["best_epoch"].values
-        
+    for group_key, group in df.groupby(group_cols):
+        mult, s_floor, beta, m_type = group_key
         aggregated.append({
             "sigma_lr_multiplier": mult,
+            "sigma_floor": s_floor,
+            "beta_nll": beta,
             "model": m_type,
-            "mean_cv": float(np.mean(cv_vals)),
-            "mean_ece_raw": float(np.mean(ece_raw_vals)),
-            "range_ece_raw": float(np.max(ece_raw_vals) - np.min(ece_raw_vals)),
-            "mean_crps_raw": float(np.mean(crps_raw_vals)),
-            "mean_ece_scaled": float(np.mean(ece_scaled_vals)),
-            "range_ece_scaled": float(np.max(ece_scaled_vals) - np.min(ece_scaled_vals)),
-            "mean_crps_scaled": float(np.mean(crps_scaled_vals)),
-            "mean_sigma_scale": float(np.mean(scale_vals)),
-            "mean_best_epoch": float(np.mean(best_epochs)),
+            "n_seeds": len(group),
+            "mean_cv": float(np.mean(group["val_loss_stability_cv"].values)),
+            "mean_ece_raw": float(np.mean(group["ece_raw"].values)),
+            "std_ece_raw": float(np.std(group["ece_raw"].values)),
+            "mean_crps_raw": float(np.mean(group["crps_raw"].values)),
+            "mean_ece_scaled": float(np.mean(group["ece_scaled"].values)),
+            "mean_crps_scaled": float(np.mean(group["crps_scaled"].values)),
+            "mean_sigma_scale": float(np.mean(group["sigma_scale"].values)),
+            "mean_sigma_proximity": float(np.mean(group["sigma_scale_proximity"].values)),
+            "mean_raw_sigma": float(np.mean(group["mean_raw_sigma"].values)),
+            "mean_best_epoch": float(np.mean(group["best_epoch"].values)),
+            "mean_final_train_sigma": float(np.mean(group["final_train_sigma_base"].values)),
         })
 
     df_agg = pd.DataFrame(aggregated)
+    agg_csv_path = os.path.join(args.checkpoint_dir, "sigma_lr_ablation_aggregated.csv")
+    df_agg.to_csv(agg_csv_path, index=False)
 
     # Print Summary Markdown Table
-    print("\n" + "=" * 140)
-    print("  AGGREGATED SIGMA LR DECOUPLING ABLATION RESULTS")
-    print("=" * 140)
-    cols = ["sigma_lr_multiplier", "model", "mean_cv",
-            "mean_ece_raw", "range_ece_raw", "mean_crps_raw",
-            "mean_ece_scaled", "range_ece_scaled", "mean_crps_scaled",
-            "mean_sigma_scale", "mean_best_epoch"]
+    print("\n" + "=" * 160)
+    print("  AGGREGATED SIGMA STABILITY ABLATION RESULTS")
+    print("=" * 160)
+    cols = ["sigma_lr_multiplier", "sigma_floor", "beta_nll", "model", "n_seeds",
+            "mean_ece_raw", "std_ece_raw", "mean_crps_raw",
+            "mean_sigma_scale", "mean_sigma_proximity", "mean_raw_sigma",
+            "mean_best_epoch", "mean_final_train_sigma"]
     header = " | ".join(cols)
     sep = " | ".join(["---"] * len(cols))
     print(f"| {header} |")
@@ -409,14 +450,15 @@ def main(args: argparse.Namespace) -> None:
             for c in cols
         )
         print(f"| {row_str} |")
-    print("=" * 140)
+    print("=" * 160)
 
     # Print per-seed detail table
-    print("\n" + "-" * 100)
+    print("\n" + "-" * 140)
     print("  PER-SEED DETAILS")
-    print("-" * 100)
-    detail_cols = ["sigma_lr_multiplier", "model", "seed", "best_epoch",
-                   "ece_raw", "ece_scaled", "sigma_scale", "val_loss_stability_cv"]
+    print("-" * 140)
+    detail_cols = ["sigma_lr_multiplier", "sigma_floor", "beta_nll", "model", "seed",
+                   "best_epoch", "ece_raw", "crps_raw", "sigma_scale",
+                   "sigma_scale_proximity", "mean_raw_sigma", "final_train_sigma_base"]
     print("| " + " | ".join(detail_cols) + " |")
     print("| " + " | ".join(["---"] * len(detail_cols)) + " |")
     for _, row in df.iterrows():
@@ -425,97 +467,144 @@ def main(args: argparse.Namespace) -> None:
             for c in detail_cols
         )
         print(f"| {row_str} |")
-    print("-" * 100)
+    print("-" * 140)
 
-    # Revised Interpretation logic
-    n_seeds = df["seed"].nunique()
-
-    cali_10 = df_agg[(df_agg["sigma_lr_multiplier"] == 1.0) & (df_agg["model"] == "CALI-PRED")]
-    cali_25 = df_agg[(df_agg["sigma_lr_multiplier"] == 2.5) & (df_agg["model"] == "CALI-PRED")]
-
+    # ======================================================================== #
+    # Interpretation
+    # ======================================================================== #
     print("\n" + "=" * 80)
     print("  INTERPRETATION SUMMARY")
     print("=" * 80)
 
-    # Stability conclusion (this was the valid finding)
-    if len(cali_10) > 0 and len(cali_25) > 0:
-        cv_10 = cali_10.iloc[0]["mean_cv"]
-        cv_25 = cali_25.iloc[0]["mean_cv"]
-        cv_drop = (cv_25 - cv_10) / (cv_25 + 1e-8)
+    # Find the configuration with sigma_scale closest to 1.0 (CALI-PRED only)
+    cali_rows = df_agg[df_agg["model"] == "CALI-PRED"]
+    if len(cali_rows) > 0:
+        best_row = cali_rows.loc[cali_rows["mean_sigma_proximity"].idxmin()]
+        print(
+            f"\n[BEST SIGMA CALIBRATION] CALI-PRED configuration with sigma_scale closest to 1.0:\n"
+            f"  mult={best_row['sigma_lr_multiplier']:.2f}, floor={best_row['sigma_floor']:.3f}, "
+            f"beta={best_row['beta_nll']:.1f}\n"
+            f"  -> sigma_scale={best_row['mean_sigma_scale']:.4f} "
+            f"(proximity={best_row['mean_sigma_proximity']:.4f})\n"
+            f"  -> ECE_raw={best_row['mean_ece_raw']:.4f}, CRPS_raw={best_row['mean_crps_raw']:.4f}\n"
+            f"  -> mean_best_epoch={best_row['mean_best_epoch']:.1f} "
+            f"(>4 means training actually progressed past warmup)\n"
+            f"  -> mean_raw_sigma={best_row['mean_raw_sigma']:.4f} "
+            f"(should be ~0.2-0.5 for well-calibrated z-scored data)"
+        )
 
-        if cv_drop >= 0.50:
-            print(
-                "[STABILITY] The decoupled sigma learning rate is a primary driver "
-                "of training instability. Setting multiplier=1.0 substantially reduces "
-                "validation loss volatility."
-            )
-        else:
-            print(
-                "[STABILITY] Instability persists even at multiplier=1.0 "
-                f"(CV: {cv_10:.4f} at 1.0x vs {cv_25:.4f} at 2.5x). "
-                "The decoupled LR is a contributor but NOT the root cause. "
-                "Investigate: cosine annealing + NLL log(sigma^2) interaction, "
-                "sigma_floor, gradient clipping threshold, calibration_weight."
-            )
+    # Check if sigma floor prevents collapse (train sigma stays above floor)
+    if len(cali_rows) > 0:
+        for _, row in cali_rows.iterrows():
+            if row["mean_final_train_sigma"] < row["sigma_floor"] * 1.2:
+                print(
+                    f"\n[FLOOR LOAD-BEARING WARNING] floor={row['sigma_floor']:.3f}: "
+                    f"final train sigma ({row['mean_final_train_sigma']:.4f}) is near or "
+                    f"at the floor. Check that DTI uncertainty responsiveness (Fig. 1 right) "
+                    f"still shows meaningful separation across strata — the floor may be "
+                    f"compressing your core dynamic range result."
+                )
 
-    # ECE/CRPS conclusion (with proper caveats)
-    if len(cali_10) > 0 and len(cali_25) > 0:
-        range_10 = cali_10.iloc[0]["range_ece_raw"]
-        range_25 = cali_25.iloc[0]["range_ece_raw"]
-        mean_scale = df["sigma_scale"].mean()
-
-        print()
-        if n_seeds <= 2:
-            print(
-                f"[ECE/CRPS] INCONCLUSIVE with n={n_seeds} seeds. "
-                "Cannot distinguish real effect from seed-level noise. "
-                "Need n>=5 seeds for reliable ECE/CRPS comparison."
-            )
-        if range_25 > range_10 * 1.2:
-            print(
-                f"[REPRODUCIBILITY] Seed-to-seed ECE range is WIDER at 2.5x "
-                f"(raw: {range_25:.4f}) than at 1.0x (raw: {range_10:.4f}). "
-                "A lower mean ECE with wider range is NOT evidence of improvement."
-            )
-        if mean_scale > 2.0:
-            print(
-                f"[SIGMA SCALE WARNING] Mean post-hoc sigma scale = {mean_scale:.2f}x. "
-                "The model's raw sigma predictions are systematically mis-calibrated "
-                "by this factor. The 'scaled' ECE/CRPS values are distorted by this "
-                "post-hoc correction. The 'raw' values reflect the model's actual "
-                "learned uncertainty. Investigate why sigma is off by ~{:.0f}x before "
-                "trusting absolute calibration numbers.".format(mean_scale)
-            )
+    # Stability comparison
+    if len(cali_rows) > 1:
+        most_stable = cali_rows.loc[cali_rows["mean_cv"].idxmin()]
+        least_stable = cali_rows.loc[cali_rows["mean_cv"].idxmax()]
+        print(
+            f"\n[STABILITY] Most stable config: mult={most_stable['sigma_lr_multiplier']:.2f}, "
+            f"floor={most_stable['sigma_floor']:.3f} (CV={most_stable['mean_cv']:.4f})\n"
+            f"            Least stable:      mult={least_stable['sigma_lr_multiplier']:.2f}, "
+            f"floor={least_stable['sigma_floor']:.3f} (CV={least_stable['mean_cv']:.4f})"
+        )
 
     print("=" * 80)
 
-    # Plot loss curves in a 2x2 grid (Seeds x Multipliers)
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharey=False)
-    
-    # Grid indexing: 
-    # Row 0: Seed 42, Col 0: mult 1.0, Col 1: mult 2.5
-    # Row 1: Seed 456, Col 0: mult 1.0, Col 1: mult 2.5
-    seed_idx_map = {42: 0, 456: 1}
-    mult_idx_map = {1.0: 0, 2.5: 1}
-    
-    for (mult, seed, m_type), losses in plot_histories.items():
-        row = seed_idx_map[seed]
-        col = mult_idx_map[mult]
-        axes[row, col].plot(range(1, len(losses) + 1), losses, label=f"{m_type}", marker='o')
-        axes[row, col].set_title(f"Seed {seed} | mult={mult}")
-        axes[row, col].set_xlabel("Epoch")
-        axes[row, col].set_ylabel("Validation Loss")
-        axes[row, col].legend()
-        axes[row, col].grid(True)
+    # ======================================================================== #
+    # Diagnostic Plots
+    # ======================================================================== #
+    # Plot 1: Sigma scale proximity heatmap (multiplier x floor)
+    if len(cali_rows) > 0 and len(multipliers) > 1 and len(sigma_floors) > 1:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-    plt.tight_layout()
-    plot_path = os.path.join(args.checkpoint_dir, "sigma_lr_ablation.png")
-    plt.savefig(plot_path)
-    logger.info("Diagnostic plot saved to '%s'.", plot_path)
+        for ax_idx, model_name in enumerate(["CALI-PRED", "Baseline"]):
+            ax = axes[ax_idx]
+            model_df = df_agg[df_agg["model"] == model_name]
+            if len(model_df) == 0:
+                continue
+
+            # Build heatmap matrix
+            pivot = model_df.pivot_table(
+                values="mean_sigma_proximity",
+                index="sigma_floor", columns="sigma_lr_multiplier",
+                aggfunc="mean"
+            )
+            im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn_r", origin="lower")
+            ax.set_xticks(range(len(pivot.columns)))
+            ax.set_xticklabels([f"{v:.2f}" for v in pivot.columns])
+            ax.set_yticks(range(len(pivot.index)))
+            ax.set_yticklabels([f"{v:.3f}" for v in pivot.index])
+            ax.set_xlabel("Sigma LR Multiplier")
+            ax.set_ylabel("Sigma Floor")
+            ax.set_title(f"{model_name}: |sigma_scale - 1.0|\n(lower = better calibrated)")
+
+            # Annotate cells
+            for i in range(len(pivot.index)):
+                for j in range(len(pivot.columns)):
+                    val = pivot.values[i, j]
+                    if np.isfinite(val):
+                        ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                                color="black" if val < 3 else "white", fontsize=9)
+            fig.colorbar(im, ax=ax, shrink=0.8)
+
+        plt.tight_layout()
+        heatmap_path = os.path.join(args.checkpoint_dir, "sigma_calibration_heatmap.png")
+        plt.savefig(heatmap_path, dpi=150)
+        logger.info("Sigma calibration heatmap saved to '%s'.", heatmap_path)
+        plt.close()
+
+    # Plot 2: Best epoch heatmap (did training progress past warmup?)
+    if len(cali_rows) > 0 and len(multipliers) > 1 and len(sigma_floors) > 1:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        for ax_idx, model_name in enumerate(["CALI-PRED", "Baseline"]):
+            ax = axes[ax_idx]
+            model_df = df_agg[df_agg["model"] == model_name]
+            if len(model_df) == 0:
+                continue
+
+            pivot = model_df.pivot_table(
+                values="mean_best_epoch",
+                index="sigma_floor", columns="sigma_lr_multiplier",
+                aggfunc="mean"
+            )
+            im = ax.imshow(pivot.values, aspect="auto", cmap="YlGnBu", origin="lower",
+                          vmin=4, vmax=args.epochs)
+            ax.set_xticks(range(len(pivot.columns)))
+            ax.set_xticklabels([f"{v:.2f}" for v in pivot.columns])
+            ax.set_yticks(range(len(pivot.index)))
+            ax.set_yticklabels([f"{v:.3f}" for v in pivot.index])
+            ax.set_xlabel("Sigma LR Multiplier")
+            ax.set_ylabel("Sigma Floor")
+            ax.set_title(f"{model_name}: Mean Best Epoch\n(>4 = training progressed past warmup)")
+
+            for i in range(len(pivot.index)):
+                for j in range(len(pivot.columns)):
+                    val = pivot.values[i, j]
+                    if np.isfinite(val):
+                        ax.text(j, i, f"{val:.1f}", ha="center", va="center",
+                                color="black", fontsize=9)
+            fig.colorbar(im, ax=ax, shrink=0.8)
+
+        plt.tight_layout()
+        epoch_path = os.path.join(args.checkpoint_dir, "sigma_best_epoch_heatmap.png")
+        plt.savefig(epoch_path, dpi=150)
+        logger.info("Best epoch heatmap saved to '%s'.", epoch_path)
+        plt.close()
+
+    logger.info("[OK] Ablation study complete. Results in '%s'.", args.checkpoint_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Ablation Study: Decoupled Sigma Learning Rate Multiplier",
+        description="Ablation Study: Sigma Head Stabilization (LR x Floor x beta-NLL)",
     )
     parser.add_argument(
         "--dataset", type=str, default="metropt",
@@ -526,7 +615,7 @@ if __name__ == "__main__":
         help="Path to the raw CSV file.",
     )
     parser.add_argument("--window-size", type=int, default=60)
-    parser.add_argument("--stride", type=int, default=100) # Stride 100 for speed
+    parser.add_argument("--stride", type=int, default=200)  # Stride 200 for speed
     parser.add_argument("--forecast-horizon", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=25)
@@ -549,5 +638,29 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max-windows", type=int, default=None)
 
+    # Ablation grid axes
+    parser.add_argument(
+        "--multipliers", type=float, nargs="+", default=[0.3, 0.5, 1.0, 2.5],
+        help="Sigma LR multiplier values to sweep (default: 0.3 0.5 1.0 2.5).",
+    )
+    parser.add_argument(
+        "--sigma-floors", type=float, nargs="+", default=[0.01, 0.1, 0.2],
+        help="Sigma floor values to sweep (default: 0.01 0.1 0.2).",
+    )
+    parser.add_argument(
+        "--beta-nlls", type=float, nargs="+", default=[0.0],
+        help="Beta-NLL values to sweep (default: 0.0; add 0.5 1.0 for full sweep).",
+    )
+    parser.add_argument(
+        "--seeds", type=int, nargs="+", default=[42, 456, 789],
+        help="Random seeds to sweep (default: 42 456 789).",
+    )
+    parser.add_argument(
+        "--sigma-init-bias", type=float, default=0.5,
+        help="Initial bias for sigma head (default: 0.5).",
+    )
+
     args = parser.parse_args()
     main(args)
+
+

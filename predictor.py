@@ -305,10 +305,18 @@ class CaliPredTransformer(nn.Module):
         inflation at DTI = 0.5 (~1.97×) while leaving DTI = 1.0 at
         exactly 1.0×. Set to 0.0 to recover the original behavior
         (``softplus(0) ≈ 0.693``).
-    sigma_floor : float, default 1e-3
+    sigma_floor : float, default 0.1
         Additive floor on the base (pre-inflation) predicted sigma,
         preventing a degenerate zero-variance (infinitely confident)
-        prediction.
+        prediction. Set to 0.1 for z-scored data to prevent the
+        well-known NLL sigma collapse pathology where the sigma head
+        overfits to shrinking training residuals.
+    sigma_init_bias : float, default 0.5
+        Initialization value for the sigma head's bias term. On z-scored
+        data, ``softplus(0.5) ≈ 1.07`` places the initial sigma_base
+        near the unit-variance regime, avoiding the cold-start problem
+        where ``softplus(~0) ≈ 0.69`` is already too low. Set to 0.0
+        to use default PyTorch initialization.
     """
 
     def __init__(
@@ -323,8 +331,9 @@ class CaliPredTransformer(nn.Module):
         max_len: int = 4096,
         max_uncertainty_inflation: float = 10.0,
         alpha_init: float = 0.5,
-        sigma_floor: float = 1e-3,
+        sigma_floor: float = 0.1,
         use_temperature: bool = False,
+        sigma_init_bias: float = 0.5,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -345,6 +354,12 @@ class CaliPredTransformer(nn.Module):
         # Separate heads for mu (predictions) and sigma (base uncertainty)
         self.mu_head = nn.Linear(d_model, self.output_dim)
         self.sigma_head = nn.Linear(d_model, self.output_dim)
+
+        # Initialize sigma head bias for z-scored data so that the initial
+        # prediction is softplus(sigma_init_bias) + sigma_floor, placing it
+        # near the unit-variance regime rather than the too-low default.
+        if sigma_init_bias != 0.0:
+            nn.init.constant_(self.sigma_head.bias, sigma_init_bias)
 
         # Learnable global scale factor for base sigma (log space, exp(0.0) = 1.0)
         self.sigma_temperature_raw = nn.Parameter(torch.tensor([0.0]))
@@ -463,6 +478,13 @@ class TrustCalibratedLoss(nn.Module):
         Upper quantile level for the calibration term / reported bound.
     calibration_weight : float, default 0.2
         Weight on the pinball calibration term relative to the NLL term.
+    beta_nll : float, default 0.0
+        β-NLL reweighting exponent (Seitzer et al. 2022). Multiplies
+        the NLL loss by ``sigma.detach().pow(2 * beta_nll)``, which
+        dampens the gradient signal when sigma is small and thereby
+        prevents the runaway sigma collapse pathology. Set to 0.0 for
+        standard NLL (no reweighting). Recommended values: 0.5 (balanced
+        dampening) or 1.0 (full dampening of sigma-dependent gradients).
     eps : float, default 1e-6
         Numerical floor on sigma before computing NLL / the Normal
         distribution's inverse CDF.
@@ -473,6 +495,7 @@ class TrustCalibratedLoss(nn.Module):
         lower_q: float = 0.05,
         upper_q: float = 0.95,
         calibration_weight: float = 0.2,
+        beta_nll: float = 0.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -481,6 +504,7 @@ class TrustCalibratedLoss(nn.Module):
         self.lower_q = lower_q
         self.upper_q = upper_q
         self.calibration_weight = calibration_weight
+        self.beta_nll = beta_nll
         self.eps = eps
 
     @staticmethod
@@ -542,16 +566,24 @@ class TrustCalibratedLoss(nn.Module):
 
         sigma_safe = sigma.clamp_min(self.eps)  # [B, T, O]
 
-        # Gaussian NLL: 0.5 * log(2*pi*sigma^2) + (y - mu)^2 / (2*sigma^2).
-        # Larger sigma (as forced by low DTI) directly reduces the second
-        # term's penalty for a given residual, which is the mechanism by
-        # which the model is "allowed" to be wrong on low-trust segments
-        # without being over-penalized -- provided it also honestly widens
-        # its interval, which the calibration term below enforces.
-        nll_elementwise = (
-            0.5 * torch.log(2.0 * math.pi * sigma_safe ** 2)
-            + (target - mu) ** 2 / (2.0 * sigma_safe ** 2)
-        )  # [B, T, O]
+        # Gaussian NLL decomposed into two competing terms:
+        #   log_sigma_term = 0.5 * log(2*pi*sigma^2) — penalizes small sigma (pushes UP)
+        #   residual_term  = (y - mu)^2 / (2*sigma^2) — rewards small sigma when residuals shrink
+        # The competition between these drives the sigma collapse pathology:
+        # on training data where mu fits well, residual_term dominates and
+        # the optimal sigma shrinks with the residuals.
+        log_sigma_term = 0.5 * torch.log(2.0 * math.pi * sigma_safe ** 2)  # [B, T, O]
+        residual_term = (target - mu) ** 2 / (2.0 * sigma_safe ** 2)  # [B, T, O]
+        nll_elementwise = log_sigma_term + residual_term  # [B, T, O]
+
+        # β-NLL reweighting (Seitzer et al. 2022): multiply the NLL by
+        # sigma^(2β) (detached) to dampen gradients when sigma is small.
+        # At β=0 this is standard NLL; at β=0.5 it removes the collapse
+        # incentive; at β=1.0 sigma only gets gradients from the pinball term.
+        if self.beta_nll > 0.0:
+            beta_weight = sigma_safe.detach().pow(2.0 * self.beta_nll)  # [B, T, O]
+            nll_elementwise = beta_weight * nll_elementwise
+
         nll_loss = nll_elementwise.mean()
 
         dist = torch.distributions.Normal(mu, sigma_safe)
@@ -566,6 +598,8 @@ class TrustCalibratedLoss(nn.Module):
 
         diagnostics = {
             "nll": nll_loss.detach(),
+            "nll_log_sigma": log_sigma_term.mean().detach(),
+            "nll_residual": residual_term.mean().detach(),
             "calibration": calibration_loss.detach(),
             "lower_bound": lower_bound.detach(),
             "upper_bound": upper_bound.detach(),
