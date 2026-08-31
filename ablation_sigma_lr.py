@@ -222,7 +222,8 @@ def main(args: argparse.Namespace) -> None:
 
         # Build loaders
         train_loader = torch.utils.data.DataLoader(
-            train_ds, batch_size=args.batch_size, shuffle=False, drop_last=True
+            train_ds, batch_size=args.batch_size, shuffle=False,
+            drop_last=(len(train_ds) > args.batch_size)
         )
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
         test_loader = torch.utils.data.DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)

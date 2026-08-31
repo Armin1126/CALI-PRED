@@ -45,6 +45,7 @@ Python: 3.13+
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -153,6 +154,7 @@ class IndustrialDataLoader:
                 f"Unsupported dataset_name '{dataset_name}'. "
                 f"Expected one of {list(_SUPPORTED_DATASETS.keys())}."
             )
+        expected_cols = list(_SUPPORTED_DATASETS[key])
 
         # Resolve file path if specified file doesn't exist but an alternative MetroPT/IIoT CSV exists in the same directory
         if not os.path.exists(file_path):
@@ -1052,3 +1054,4 @@ if __name__ == "__main__":
           f"({x_tensor.dtype}), mask: {tuple(mask_tensor.shape)} ({mask_tensor.dtype})")
 
     print("\nAll smoke tests passed.")
+

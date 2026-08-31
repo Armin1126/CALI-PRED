@@ -443,22 +443,26 @@ def train_model(
                 model, mu, sigma, target, dti_tensor,
             )
             epoch_base_sigmas.append(base_sigma); epoch_inflations.append(inflation); epoch_z_rmses.append(z_rmse)
-            epoch_maes.append(torch.mean(torch.abs(target - mu)).item())
-
-        scheduler.step()
-        avg_train_loss = np.mean(epoch_losses)
-        avg_train_mae = np.mean(epoch_maes)
-        avg_train_sigma_base = np.mean(epoch_base_sigmas)
-        avg_train_inflation = np.mean(epoch_inflations)
+        if len(epoch_losses) > 0:
+            scheduler.step()
+            avg_train_loss = float(np.mean(epoch_losses))
+            avg_train_mae = float(np.mean(epoch_maes))
+            avg_train_sigma_base = float(np.mean(epoch_base_sigmas))
+            avg_train_inflation = float(np.mean(epoch_inflations))
+        else:
+            avg_train_loss = 0.0
+            avg_train_mae = 0.0
+            avg_train_sigma_base = 0.0
+            avg_train_inflation = 1.0
 
         history["train_loss"].append(avg_train_loss)
-        history["train_nll"].append(float(np.mean(epoch_nlls)))
-        history["train_pinball"].append(float(np.mean(epoch_pinballs)))
-        history["train_nll_log_sigma"].append(float(np.mean(epoch_nll_log_sigmas)))
-        history["train_nll_residual"].append(float(np.mean(epoch_nll_residuals)))
+        history["train_nll"].append(float(np.mean(epoch_nlls)) if epoch_nlls else 0.0)
+        history["train_pinball"].append(float(np.mean(epoch_pinballs)) if epoch_pinballs else 0.0)
+        history["train_nll_log_sigma"].append(float(np.mean(epoch_nll_log_sigmas)) if epoch_nll_log_sigmas else 0.0)
+        history["train_nll_residual"].append(float(np.mean(epoch_nll_residuals)) if epoch_nll_residuals else 0.0)
         history["train_sigma_base"].append(float(avg_train_sigma_base))
         history["train_inflation"].append(float(avg_train_inflation))
-        history["train_z_rmse"].append(float(np.mean(epoch_z_rmses)))
+        history["train_z_rmse"].append(float(np.mean(epoch_z_rmses)) if epoch_z_rmses else 0.0)
         history["train_mae"].append(float(avg_train_mae))
 
         # --- Validation phase ---------------------------------------------- #
@@ -857,7 +861,8 @@ def main(args: argparse.Namespace) -> None:
 
     # Recreate DataLoaders to yield (x_imputed, target, ts, dti)
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=False, drop_last=True
+        train_ds, batch_size=args.batch_size, shuffle=False,
+        drop_last=(len(train_ds) > args.batch_size)
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False
