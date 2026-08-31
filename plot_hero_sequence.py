@@ -13,19 +13,38 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 def main():
-    pred_path = "checkpoints/test_predictions.npz"
-    if not os.path.exists(pred_path):
-        print(f"[ERROR] No predictions found at {pred_path}. Run pipeline.py first.")
+    import argparse
+    parser = argparse.ArgumentParser(description="Plot hero sequence from prediction npz")
+    parser.add_argument("--pred-path", type=str, default=None, help="Path to test_predictions.npz")
+    args = parser.parse_args()
+
+    pred_path = args.pred_path
+    if pred_path is None:
+        # Search for available seed prediction files
+        candidate_paths = [
+            "checkpoints/seed_123/test_predictions.npz",
+            "checkpoints/seed_42/test_predictions.npz",
+            "checkpoints/seed_456/test_predictions.npz",
+            "checkpoints/test_predictions.npz",
+        ]
+        for cp in candidate_paths:
+            if os.path.exists(cp):
+                pred_path = cp
+                break
+
+    if pred_path is None or not os.path.exists(pred_path):
+        print(f"[ERROR] No predictions found. Checked: {candidate_paths}")
         return
 
+    print(f"[INFO] Plotting Hero Sequence from: '{pred_path}'")
     data = np.load(pred_path)
-    
+
     # Load CALI-PRED predictions
     y_true = data["calipred_y_true"]
     mu_c = data["calipred_mu"]
     sigma_c = data["calipred_sigma"]
     dti_c = data["calipred_dti"]
-    
+
     # Load Baseline predictions
     mu_b = data["baseline_mu"]
     sigma_b = data["baseline_sigma"]
@@ -37,7 +56,7 @@ def main():
     window_size = 60
     best_start = -1
     min_dti_val = 1.0
-    
+
     # Simple sliding search for a degraded segment
     for i in range(0, len(y_true) - window_size, 10):
         dti_segment = dti_c[i : i + window_size]
@@ -59,26 +78,26 @@ def main():
     # Slice the data
     t = np.arange(window_size)
     y_true_seg = y_true[start:end]
-    
+
     mu_c_seg = mu_c[start:end]
     sigma_c_seg = sigma_c[start:end]
     dti_seg = dti_c[start:end]
-    
+
     mu_b_seg = mu_b[start:end]
     sigma_b_seg = sigma_b[start:end]
 
     # Calculate 90% confidence intervals (z = 1.645)
     ci_mult = 1.645
-    
+
     calipred_lower = mu_c_seg - ci_mult * sigma_c_seg
     calipred_upper = mu_c_seg + ci_mult * sigma_c_seg
-    
+
     baseline_lower = mu_b_seg - ci_mult * sigma_b_seg
     baseline_upper = mu_b_seg + ci_mult * sigma_b_seg
 
     # Create the paper figure
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    
+
     # 1. Baseline Panel
     ax1.plot(t, y_true_seg, color="black", label="True Target", linewidth=1.5)
     ax1.plot(t, mu_b_seg, color="tab:red", linestyle="--", label="Baseline Mean", linewidth=1.2)
@@ -111,8 +130,9 @@ def main():
     plot_path = "checkpoints/hero_sequence_calibration.png"
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    
+
     print(f"\n[OK] Paper-ready calibration figure saved to '{plot_path}'")
 
 if __name__ == "__main__":
     main()
+
