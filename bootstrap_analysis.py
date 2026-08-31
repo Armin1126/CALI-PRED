@@ -513,31 +513,19 @@ if __name__ == "__main__":
             )
             all_results[p] = res
 
-        # If multiple files, print a consolidated LaTeX summary
+        # If multiple files, print a consolidated clean text summary
         if len(pred_paths) > 1:
-            print("\n" + "=" * 70)
-            print("  CONSOLIDATED MULTI-SEED LATEX TABLE SNIPPET")
-            print("=" * 70)
-            print("% Copy and paste into LaTeX:")
-            print("\\begin{table}[h!]")
-            print("\\centering")
-            print("\\begin{tabular}{lcccc}")
-            print("\\toprule")
-            print("Seed & Baseline ECE [95\\% CI] & CALI-PRED ECE [95\\% CI] & Baseline CRPS [95\\% CI] & CALI-PRED CRPS [95\\% CI] \\\\")
-            print("\\midrule")
+            print("\n" + "=" * 80)
+            print("  CONSOLIDATED MULTI-SEED SUMMARY (95% BOOTSTRAP CI)")
+            print("=" * 80)
+            print(f"{'Seed':<10} | {'Baseline ECE [95% CI]':<25} | {'CALI-PRED ECE [95% CI]':<25}")
+            print("-" * 80)
             for p, r in all_results.items():
                 s_name = os.path.basename(os.path.dirname(p)) if "seed_" in p else "Overall"
                 b_ece = f"{r['ece']['baseline']['point_estimate']:.4f} [{r['ece']['baseline']['ci_lower']:.4f}, {r['ece']['baseline']['ci_upper']:.4f}]"
                 c_ece = f"{r['ece']['calipred']['point_estimate']:.4f} [{r['ece']['calipred']['ci_lower']:.4f}, {r['ece']['calipred']['ci_upper']:.4f}]"
-                b_crps = f"{r['crps']['baseline']['point_estimate']:.4f} [{r['crps']['baseline']['ci_lower']:.4f}, {r['crps']['baseline']['ci_upper']:.4f}]"
-                c_crps = f"{r['crps']['calipred']['point_estimate']:.4f} [{r['crps']['calipred']['ci_lower']:.4f}, {r['crps']['calipred']['ci_upper']:.4f}]"
-                print(f"{s_name} & {b_ece} & {c_ece} & {b_crps} & {c_crps} \\\\")
-            print("\\bottomrule")
-            print("\\end{tabular}")
-            print("\\caption{Window-block bootstrap 95\\% confidence intervals across multi-seed runs.}")
-            print("\\label{tab:bootstrap_ci}")
-            print("\\end{table}")
-            print("=" * 70)
+                print(f"{s_name:<10} | {b_ece:<25} | {c_ece:<25}")
+            print("=" * 80)
     else:
         print(f"[SKIP] No saved predictions found in '{args.checkpoint_dir}'.")
         print("  Run `python run_multiseed_pipeline.py` or `pipeline.py` first.")
