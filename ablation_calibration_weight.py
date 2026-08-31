@@ -152,6 +152,7 @@ def run_ablation(args: argparse.Namespace) -> None:
             d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
             dropout=0.1, max_uncertainty_inflation=args.max_inflation,
             alpha_init=args.alpha_init,
+            sigma_floor=args.sigma_floor,
         )
         train_model(
             model=model_calipred, loss_fn=loss_fn,
@@ -161,6 +162,7 @@ def run_ablation(args: argparse.Namespace) -> None:
             n_features=n_features, epochs=args.epochs, lr=args.lr,
             device=device, checkpoint_dir=ckpt_dir, use_real_dti=True,
             missing_rate_sampler=train_val_sampler,
+            sigma_lr_multiplier=args.sigma_lr_multiplier,
             val_warmup_epochs=getattr(args, "val_warmup_epochs", 3),
         )
         # Load best and evaluate
@@ -194,6 +196,7 @@ def run_ablation(args: argparse.Namespace) -> None:
             d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
             dropout=0.1, max_uncertainty_inflation=args.max_inflation,
             alpha_init=args.alpha_init,
+            sigma_floor=args.sigma_floor,
         )
         train_model(
             model=model_baseline, loss_fn=loss_fn,
@@ -203,6 +206,7 @@ def run_ablation(args: argparse.Namespace) -> None:
             n_features=n_features, epochs=args.epochs, lr=args.lr,
             device=device, checkpoint_dir=ckpt_dir, use_real_dti=False,
             missing_rate_sampler=train_val_sampler,
+            sigma_lr_multiplier=args.sigma_lr_multiplier,
             val_warmup_epochs=getattr(args, "val_warmup_epochs", 3),
         )
         # Load best and evaluate
@@ -339,6 +343,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val-warmup-epochs", type=int, default=3,
         help="Number of initial warmup epochs before checkpoint eligibility (default: 3).",
+    )
+    parser.add_argument(
+        "--sigma-lr-multiplier", type=float, default=0.5,
+        help="Multiplier for the learning rate of the sigma head (default: 0.5).",
+    )
+    parser.add_argument(
+        "--sigma-floor", type=float, default=0.1,
+        help="Additive floor on base sigma (default: 0.1).",
     )
 
     args = parser.parse_args()
