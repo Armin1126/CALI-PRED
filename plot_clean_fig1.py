@@ -81,7 +81,10 @@ def main():
         y_true, data["calipred_mu"].flatten(), data["calipred_sigma"].flatten(), dti
     )
     base_res = compute_calibration_data(
-        data["baseline_y_true"].flatten(), data["baseline_mu"].flatten(), data["baseline_sigma"].flatten(), data["baseline_dti"].flatten()
+        data["baseline_y_true"].flatten(),
+        data["baseline_mu"].flatten(),
+        data["baseline_sigma"].flatten(),
+        dti, # Use true telemetry DTI to evaluate baseline response to degradation
     )
     
     fig, (ax_rel, ax_w) = plt.subplots(1, 2, figsize=(11, 4.5), dpi=300)
