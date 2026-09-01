@@ -98,7 +98,7 @@ def main():
     
     ax_rel.plot(
         base_res["nominal_levels"], base_res["empirical_coverage"],
-        marker="o", color=base_color, label=f"Baseline Predictor (ECE = {base_res['mean_ece']:.3f})"
+        marker="o", color=base_color, label="Baseline Predictor"
     )
     ax_rel.fill_between(
         base_res["nominal_levels"], base_res["nominal_levels"], base_res["empirical_coverage"],
@@ -107,7 +107,7 @@ def main():
     
     ax_rel.plot(
         cali_res["nominal_levels"], cali_res["empirical_coverage"],
-        marker="s", color=cali_color, label=f"CALIPRED (ECE = {cali_res['mean_ece']:.3f})"
+        marker="s", color=cali_color, label="CALIPRED"
     )
     ax_rel.fill_between(
         cali_res["nominal_levels"], cali_res["nominal_levels"], cali_res["empirical_coverage"],
