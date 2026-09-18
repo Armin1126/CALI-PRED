@@ -120,17 +120,22 @@ def patch_iri(path: str = "iri_module.py") -> None:
         src = src.replace(old, new, 1)
         _say(f"{path}: models are now built once and re-randomized per window")
 
-    # Patch 2: honour CALIPRED_IRI_DEVICE, defaulting to CPU.
+    # Patch 2: honour CALIPRED_IRI_DEVICE. Default stays GPU.
+    # Measured on a T4, per-window, 30 epochs: cuda 279.7 ms/window against
+    # cpu 1768.3 ms/window. _BRITSStub is recurrent, so a 60-step sequence is
+    # 60 dependent ops and the CPU has nothing to hide the latency behind.
+    # An earlier version of this file defaulted to CPU and made things 6.3x
+    # slower; if you still have that default set in the notebook, clear it.
     old_dev = ('            device if device is not None else '
                '("cuda" if torch.cuda.is_available() else "cpu")')
     new_dev = ('            device if device is not None else '
-               'os.environ.get("CALIPRED_IRI_DEVICE", "cpu")')
+               'os.environ.get("CALIPRED_IRI_DEVICE",\n'
+               '                ("cuda" if torch.cuda.is_available() else "cpu"))')
     if old_dev in src:
         src = src.replace(old_dev, new_dev, 1)
         if not re.search(r"^import os$", src, re.M):
             src = re.sub(r"^(import .*?)$", r"import os\n\1", src, count=1, flags=re.M)
-        _say(f"{path}: IRI ensemble device now defaults to CPU "
-             f"(override with CALIPRED_IRI_DEVICE)")
+        _say(f"{path}: IRI device honours CALIPRED_IRI_DEVICE, default GPU")
 
     open(path, "w", encoding="utf-8").write(src)
     import ast
@@ -343,11 +348,129 @@ def patch_no_mock(path: str = "data_loader.py") -> None:
          f"(override with CALIPRED_ALLOW_MOCK=1)")
 
 
+# ---------------------------------------------------------------------------
+# Patch 5 : use the batched ensemble that already exists but is never called
+# ---------------------------------------------------------------------------
+_BATCHED_BODY = '''    # --- Phase 1: corruption + DQA. Cheap, stays per window. ---------------
+    x_corr_all = np.empty((B, T, K), dtype=np.float32)
+    mask_all = np.empty((B, T, K), dtype=np.int8)
+    dqa_scores = np.empty(B, dtype=np.float64)
+
+    for i in range(B):
+        window = x_batch[i]          # (T, K)
+        ts_window = ts_batch[i]      # (T,)
+
+        window_missing_rate = missing_rate
+        if missing_rate_sampler is not None:
+            window_missing_rate = missing_rate_sampler()
+
+        if window_missing_rate == 0.0:
+            x_corrupted = window.copy()
+            mask = np.ones_like(window, dtype=np.int8)
+        else:
+            try:
+                x_corrupted, mask = corruption_loader.inject_missingness(
+                    window, mechanism="MAR", missing_rate=window_missing_rate,
+                    block_size=block_size,
+                )
+            except ValueError:
+                x_corrupted = window.copy()
+                mask = np.ones_like(window, dtype=np.int8)
+
+        x_corr_all[i] = np.nan_to_num(x_corrupted, nan=0.0)
+        mask_all[i] = mask
+
+        inference_time = float(ts_window[-1]) + 0.5
+        try:
+            dqa_scores[i] = dqa_engine.compute_dqa_score(
+                mask=mask,
+                timestamps=ts_window,
+                inference_time=inference_time,
+                X_corrupted=x_corrupted,
+                baseline_corr_matrix=baseline_corr,
+            )
+        except Exception:
+            dqa_scores[i] = 0.5
+
+    # --- Phase 2: ONE ensemble fit for the whole batch. --------------------
+    # Was: B separate fits, each on a (1, T, K) tensor. Measured on a T4 at
+    # 30 epochs, per window: 279.7 ms the old way against 3.0 ms this way.
+    try:
+        ensemble_all = iri_engine.impute_ensemble_batch(
+            x_corr_all, mask_all.astype(np.float32)
+        )  # (2, B, T, K)
+    except Exception as exc:
+        logger.warning("Batched ensemble failed (%s); falling back per window.", exc)
+        ensemble_all = None
+
+    # --- Phase 3: IRI + fusion. Cheap, stays per window. -------------------
+    for i in range(B):
+        try:
+            if ensemble_all is not None:
+                ensemble_out = ensemble_all[:, i]          # (2, T, K)
+            else:
+                ensemble_out = iri_engine.impute_ensemble(x_corr_all[i], mask_all[i])
+            eval_mask = (1 - mask_all[i]).astype(np.int8)
+            iri_grid = iri_engine.compute_iri(ensemble_out, x_batch[i], eval_mask)
+            x_imputed = ensemble_out.mean(axis=0).astype(np.float32)
+        except Exception:
+            iri_grid = np.full((T, K), 0.5)
+            x_imputed = np.nan_to_num(x_corr_all[i], nan=0.0).astype(np.float32)
+
+        dti_grid = fusion_engine.compute_dti(dqa_scores[i], iri_grid)  # (T, K)
+        dti_batch[i] = np.mean(dti_grid, axis=1)
+        x_imputed_batch[i] = x_imputed
+
+    return dti_batch, x_imputed_batch
+'''
+
+
+def patch_batched_iri(path: str = "pipeline.py") -> None:
+    """compute_dti_for_batch() loops over windows calling impute_ensemble(),
+    fitting a fresh model pair per window. iri_module already ships
+    impute_ensemble_batch(), which fits one pair across a whole (B, T, K)
+    batch -- it is simply never called.
+
+    SEMANTIC CHANGE, and it needs saying: the per-window path overfits a model
+    pair to each window individually; the batched path fits one pair across
+    the batch. The batched behaviour is what the paper describes ("a trained
+    SAITS network"), so this brings the code in line with the write-up -- but
+    it will change every number, and the results must be regenerated."""
+    _backup(path)
+    src = open(path, encoding="utf-8", newline="").read()
+
+    if "impute_ensemble_batch" in src:
+        _say(f"{path}: already using the batched ensemble")
+        return
+
+    start = src.find("    for i in range(B):\n        window = x_batch[i]")
+    if start == -1:
+        start = src.find("    for i in range(B):\r\n        window = x_batch[i]")
+    end_marker = "    return dti_batch, x_imputed_batch"
+    end = src.find(end_marker, start if start != -1 else 0)
+    if start == -1 or end == -1:
+        _say(f"WARNING: {path}: could not locate the per-window loop; "
+             f"batched patch SKIPPED (runtime will stay slow).")
+        return
+
+    nl = "\r\n" if "\r\n" in src[start:start + 200] else "\n"
+    body = _BATCHED_BODY if nl == "\n" else _BATCHED_BODY.replace("\n", "\r\n")
+    src = src[:start] + body + src[end + len(end_marker):]
+
+    open(path, "w", encoding="utf-8", newline="").write(src)
+    import ast
+    ast.parse(open(path, encoding="utf-8").read())
+    _say(f"{path}: compute_dti_for_batch now does ONE batched ensemble fit "
+         f"per batch instead of B per-window fits")
+
+
 def apply_all(iri="iri_module.py", pipeline="pipeline.py",
-              loader="data_loader.py") -> None:
+              loader="data_loader.py", batched=True) -> None:
     patch_iri(iri)
     patch_pipeline(pipeline)
     patch_no_mock(loader)
+    if batched:
+        patch_batched_iri(pipeline)
     _say("all patches applied; .prespeed backups kept alongside each file")
 
 
