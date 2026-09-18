@@ -285,9 +285,69 @@ def patch_pipeline(path: str = "pipeline.py") -> None:
     ast.parse(open(path, encoding="utf-8").read())
 
 
-def apply_all(iri="iri_module.py", pipeline="pipeline.py") -> None:
+# ---------------------------------------------------------------------------
+# Patch 4 : refuse to silently substitute synthetic data
+# ---------------------------------------------------------------------------
+def patch_no_mock(path: str = "data_loader.py") -> None:
+    """IndustrialDataLoader catches a missing CSV, logs an error, and then
+    carries on with 2,000 timesteps of synthetic mock data. The run completes
+    and produces numbers that look entirely ordinary. Nothing downstream --
+    not the metrics, not the figures, not the paper -- can tell the difference.
+
+    After this patch a missing or truncated dataset raises instead. Set
+    CALIPRED_ALLOW_MOCK=1 if you genuinely want a synthetic dry run."""
+    _backup(path)
+    src = open(path, encoding="utf-8", newline="").read()
+
+    if "CALIPRED_ALLOW_MOCK" in src:
+        _say(f"{path}: already guarded")
+        return
+
+    guard = (
+        '            if os.environ.get("CALIPRED_ALLOW_MOCK") != "1":\\1'
+        '                raise FileNotFoundError(\\1'
+        '                    f"Refusing to fall back to synthetic mock data for "\\1'
+        '                    f"{file_path!r}. A run on mock data produces numbers "\\1'
+        '                    f"indistinguishable from real results. Fetch the dataset "\\1'
+        '                    f"(python download_data.py --dataset metropt), or set "\\1'
+        '                    f"CALIPRED_ALLOW_MOCK=1 for a deliberate dry run."\\1'
+        '                ) from exc\\1'
+    )
+    pat = re.compile(r"(            is_mock = True)(\r?\n)")
+    if not pat.search(src):
+        sys.exit("PATCH 4 FAILED: could not find the mock fallback branch.")
+    src = pat.sub(lambda m: m.group(1) + m.group(2)
+                  + guard.replace("\\1", m.group(2)), src, count=1)
+
+    # A truncated CSV only warns; make that fatal too.
+    pat2 = re.compile(
+        r"(            if len\(df\) < 5000:\r?\n)"
+        r"(                logger\.warning\([^\n]*\r?\n)")
+    m2 = pat2.search(src)
+    if m2:
+        nl = "\r\n" if "\r\n" in m2.group(0) else "\n"
+        extra = (f'                if os.environ.get("CALIPRED_ALLOW_MOCK") != "1":{nl}'
+                 f'                    raise ValueError({nl}'
+                 f'                        f"{{file_path!r}} has only {{len(df)}} rows; "{nl}'
+                 f'                        f"the real MetroPT record has ~1.5M. Refusing to run."{nl}'
+                 f'                    ){nl}')
+        src = src[:m2.end()] + extra + src[m2.end():]
+
+    if not re.search(r"^import os\s*$", src, re.M):
+        src = re.sub(r"^(import .*?)$", r"import os\n\1", src, count=1, flags=re.M)
+
+    open(path, "w", encoding="utf-8", newline="").write(src)
+    import ast
+    ast.parse(open(path, encoding="utf-8").read())
+    _say(f"{path}: mock-data fallback now raises "
+         f"(override with CALIPRED_ALLOW_MOCK=1)")
+
+
+def apply_all(iri="iri_module.py", pipeline="pipeline.py",
+              loader="data_loader.py") -> None:
     patch_iri(iri)
     patch_pipeline(pipeline)
+    patch_no_mock(loader)
     _say("all patches applied; .prespeed backups kept alongside each file")
 
 
