@@ -1,0 +1,9 @@
+# Normalize line endings so Windows/Colab round-trips stop producing
+# whole-file diffs. Text files are stored LF in the repo.
+* text=auto eol=lf
+
+*.png binary
+*.pdf binary
+*.npz binary
+*.pt  binary
+*.csv binary

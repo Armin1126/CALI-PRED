@@ -9,8 +9,6 @@ per window (length T=60, features K=15) to demonstrate real-time edge viability.
 import time
 import numpy as np
 import torch
-import torch.nn as nn
-from typing import Tuple
 
 from data_loader import IndustrialDataLoader
 from dqa_module import UpstreamDQAEngine
@@ -138,3 +136,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -115,3 +115,4 @@ if __name__ == "__main__":
 
     ok = verify(args.history_path)
     sys.exit(0 if ok else 1)
+

@@ -40,7 +40,7 @@ def run_multiseed_diagnostics(pred_paths: list[str], save_dir: str = "checkpoint
     # Accumulators for seed results
     seed_per_level_cov_c = []  # shape: (n_seeds, len(NOMINAL_LEVELS))
     seed_per_level_cov_b = []
-    
+
     # 5 quantile bins
     seed_bin_ece_c = []  # shape: (n_seeds, 5)
     seed_bin_ece_b = []
@@ -210,3 +210,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

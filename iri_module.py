@@ -86,12 +86,12 @@ logger = logging.getLogger("ImputationReliabilityEngine")
 # lightweight, architecturally-faithful PyTorch stubs that preserve the two
 # properties that matter for IRI: (a) SAITS's parallel self-attention
 # reconstruction and (b) BRITS's recurrent, direction-aware reconstruction.
-try:
-    import pypots  # noqa: F401
-    _PYPOTS_AVAILABLE = True
+import importlib.util
+
+_PYPOTS_AVAILABLE = importlib.util.find_spec("pypots") is not None
+if _PYPOTS_AVAILABLE:
     logger.info("PyPOTS detected; real SAITS/BRITS backends may be wired in.")
-except ImportError:
-    _PYPOTS_AVAILABLE = False
+else:
     logger.info(
         "PyPOTS not available in this environment; using internal "
         "self-attention (SAITS-style) and recurrent (BRITS-style) "
@@ -815,3 +815,4 @@ if __name__ == "__main__":
           f"vs. observed positions: {iri[observed_bool].mean():.4f}")
 
     print("\nAll smoke tests passed.")
+

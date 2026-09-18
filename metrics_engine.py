@@ -57,10 +57,9 @@ Python: 3.13+
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import norm

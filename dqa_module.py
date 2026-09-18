@@ -534,3 +534,4 @@ if __name__ == "__main__":
     assert dqa_custom < dqa_baseline, "Freshness-weighted stale scenario must still score below healthy baseline."
 
     print("\nAll simulation checks passed.")
+

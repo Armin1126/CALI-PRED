@@ -559,7 +559,7 @@ def main() -> None:
     print("\n" + "=" * 135)
     print("  COMPARING BINNING SCHEMES")
     print("=" * 135)
-    
+
     fixed_stats = analyze_dti_binned_breakdown(data, "fixed")
     quantile_stats = analyze_dti_binned_breakdown(data, "quantile")
 
@@ -581,3 +581,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -302,3 +302,4 @@ if __name__ == "__main__":
     print(f"[OK] Lenient mode correctly clamped DQA=1.2 -> 1.0 before fusion, DTI={float(lenient_result):.4f}.")
 
     print("\nAll fusion engine tests passed.")
+

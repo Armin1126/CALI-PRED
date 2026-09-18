@@ -31,8 +31,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -301,3 +299,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     run_fault_validation(args)
+
