@@ -36,85 +36,13 @@ USAGE (Colab)
 Add --skip-scaled to halve runtime if you only want the unscaled variant.
 """
 from __future__ import annotations
-import argparse, json, os, re, shutil, subprocess, sys
+import argparse, json, os, subprocess, sys
 
-CONTINUOUS = ("TP2", "TP3", "H1", "DV_pressure", "Reservoirs",
-              "Oil_temperature", "Motor_current")
-BINARY = ("COMP", "DV_eletric", "Towers", "MPG", "LPS",
-          "Pressure_switch", "Oil_level", "Caudal_impulses")
-CONTINUOUS_ONLY = True
 SEEDS = (42, 123, 456)
 
 
 def log(msg):
     print(f"\n>>> {msg}", flush=True)
-
-
-# ----------------------------------------------------------------------------
-# Patching
-# ----------------------------------------------------------------------------
-def backup(path):
-    b = path + ".orig"
-    if not os.path.exists(b):
-        shutil.copy2(path, b)
-    return b
-
-
-def patch_channels(path="data_loader.py"):
-    """Restrict _SUPPORTED_DATASETS['metropt'] to the continuous channels."""
-    backup(path)
-    src = open(path, encoding="utf-8").read()
-    pat = re.compile(r'("metropt"\s*:\s*\()(.*?)(\)\s*,)', re.S)
-    m = pat.search(src)
-    if not m:
-        sys.exit("PATCH FAILED: could not locate _SUPPORTED_DATASETS['metropt'].")
-    cols = CONTINUOUS if CONTINUOUS_ONLY else CONTINUOUS + BINARY
-    body = "\n        " + ", ".join(f'"{c}"' for c in cols) + ",\n    "
-    src2 = src[:m.start()] + m.group(1) + body + m.group(3) + src[m.end():]
-    open(path, "w", encoding="utf-8").write(src2)
-
-    check = re.search(r'"metropt"\s*:\s*\((.*?)\)\s*,', src2, re.S).group(1)
-    found = re.findall(r'"([^"]+)"', check)
-    if list(found) != list(cols):
-        sys.exit(f"PATCH VERIFY FAILED: got {found}")
-    log(f"patched {path}: {len(found)} channels -> {found}")
-
-
-def patch_calibration_weight(path="pipeline.py"):
-    """Expose calibration_weight as a CLI argument instead of hard-coding 0.2."""
-    backup(path)
-    src = open(path, encoding="utf-8").read()
-
-    if "args.calibration_weight" not in src:
-        n = src.count("calibration_weight=0.2")
-        if n != 1:
-            sys.exit(f"PATCH FAILED: expected one 'calibration_weight=0.2', found {n}.")
-        src = src.replace("calibration_weight=0.2",
-                          "calibration_weight=args.calibration_weight")
-
-    if "--calibration-weight" not in src:
-        anchor = '    parser.add_argument(\n        "--seed", type=int, default=42,'
-        if anchor not in src:
-            anchor2 = 'parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")'
-            if anchor2 not in src:
-                sys.exit("PATCH FAILED: no anchor for the new argument.")
-            src = src.replace(
-                anchor2,
-                anchor2 + '\n    parser.add_argument("--calibration-weight", type=float,'
-                          ' default=0.10,\n                        help="Pinball calibration'
-                          ' weight in TrustCalibratedLoss.")')
-        else:
-            src = src.replace(
-                anchor,
-                '    parser.add_argument("--calibration-weight", type=float, default=0.10,\n'
-                '                        help="Pinball calibration weight in'
-                ' TrustCalibratedLoss.")\n' + anchor)
-
-    open(path, "w", encoding="utf-8").write(src)
-    src2 = open(path, encoding="utf-8").read()
-    if "args.calibration_weight" not in src2 or "--calibration-weight" not in src2:
-        sys.exit("PATCH VERIFY FAILED: calibration weight not wired up.")
-    log(f"patched {path}: calibration_weight is now a CLI argument (default 0.10)")
 
 
 # ----------------------------------------------------------------------------
@@ -219,10 +147,10 @@ def main():
     ap.add_argument("--stride", default="100")
     ap.add_argument("--epochs", default="25")
     ap.add_argument("--sigma-floor", default="0.10")
-    ap.add_argument("--calibration-weight", default="0.10")
+    ap.add_argument("--calibration-weight", default="0.2")
     ap.add_argument("--max-windows", default=None)
     ap.add_argument("--skip-scaled", action="store_true")
-    ap.add_argument("--skip-patch", action="store_true")
+    ap.add_argument("--skip-patch", action="store_true", help="Deprecated; source files are never patched.")
     a = ap.parse_args()
 
     if not os.path.exists("pipeline.py"):
@@ -230,15 +158,11 @@ def main():
     if not os.path.exists(a.data_path):
         sys.exit(f"data not found: {a.data_path}")
 
-    log("PATCHING")
-    if not a.skip_patch:
-        patch_channels()
-        patch_calibration_weight()
-    else:
-        log("skipped (--skip-patch)")
+    log("SAFE MODE: source files are never patched in place.")
+    log("Primary run retains the repository's 15-channel MetroPT schema. "
+        "Seven-channel runs must be implemented as a separate, explicitly configured ablation.")
 
-    log(f"RUN A: unscaled  (cw={a.calibration_weight}, "
-        f"{'continuous only' if CONTINUOUS_ONLY else 'all 15 channels'})")
+    log(f"RUN A: unscaled primary setup (15-channel schema, cw={a.calibration_weight})")
     paths_u = run_seeds(a, "checkpoints_paper_unscaled", scaled=False)
     res = {"unscaled": summarize(paths_u, "UNSCALED  (report this as the method)")}
 
@@ -247,16 +171,11 @@ def main():
         paths_s = run_seeds(a, "checkpoints_paper_scaled", scaled=True)
         res["scaled"] = summarize(paths_s, "WITH VALIDATION SIGMA SCALING")
 
-    log("EXTERNAL BASELINES + BOOTSTRAP (unscaled predictions)")
-    for script, args_ in [("benchmark_external_baselines.py", []),
-                          ("bootstrap_analysis.py", []),
-                          ("coverage_diagnostics.py", [])]:
-        if os.path.exists(script):
-            try:
-                run([sys.executable, script] + args_ + paths_u)
-            except SystemExit:
-                print(f"    ({script} did not accept those arguments -- "
-                      f"run it manually on checkpoints_paper_unscaled/)")
+    log("EXTERNAL BASELINES + BOOTSTRAP + COVERAGE DIAGNOSTICS (unscaled predictions)")
+    run([sys.executable, "benchmark_external_baselines.py", "--pred-paths", *paths_u])
+    run([sys.executable, "bootstrap_analysis.py", "--bootstrap-only", "--pred-paths", *paths_u])
+    for prediction_path in paths_u:
+        run([sys.executable, "coverage_diagnostics.py", "--pred-path", prediction_path])
 
     with open("paper_numbers.json", "w") as f:
         json.dump(res, f, indent=2)
