@@ -63,6 +63,7 @@ Python: 3.13+
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional, Tuple
 
 import numpy as np
