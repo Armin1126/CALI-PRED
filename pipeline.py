@@ -157,41 +157,43 @@ def compute_dti_for_batch(
             x_corrupted = window.copy()
             mask = np.ones_like(window, dtype=np.int8)
         else:
-            try:
-                x_corrupted, mask = corruption_loader.inject_missingness(
-                    window, mechanism="MAR", missing_rate=window_missing_rate,
-                    block_size=block_size,
-                )
-            except ValueError:
-                # Edge case: window might already have issues
-                x_corrupted = window.copy()
-                mask = np.ones_like(window, dtype=np.int8)
-
-        # Step 2: DQA
-        inference_time = float(ts_window[-1]) + 0.5
-        try:
-            dqa_score = dqa_engine.compute_dqa_score(
-                mask=mask,
-                timestamps=ts_window,
-                inference_time=inference_time,
-                X_corrupted=x_corrupted,
-                baseline_corr_matrix=baseline_corr,
+            x_corrupted, mask = corruption_loader.inject_missingness(
+                window, mechanism="MAR", missing_rate=window_missing_rate,
+                block_size=block_size,
             )
-        except Exception:
-            dqa_score = 0.5  # fallback for edge cases
 
-        # Step 3: IRI (ensemble imputation + reliability scoring)
-        try:
-            ensemble_out = iri_engine.impute_ensemble(x_corrupted, mask)  # (2, T, K)
-            eval_mask = (1 - mask).astype(np.int8)
-            iri_grid = iri_engine.compute_iri(
-                ensemble_out, window, eval_mask,
-            )  # (T, K)
-            x_imputed = ensemble_out.mean(axis=0).astype(np.float32)  # (T, K)
-        except Exception:
-            iri_grid = np.full((T, K), 0.5)
-            x_imputed = x_corrupted.copy()
-            x_imputed = np.nan_to_num(x_imputed, nan=0.0).astype(np.float32)
+        # Step 2: DQA. For offline data, assume a fixed 0.5 s processing delay.
+        inference_time = float(ts_window[-1]) + 0.5
+        dqa_score = dqa_engine.compute_dqa_score(
+            mask=mask,
+            timestamps=ts_window,
+            inference_time=inference_time,
+            X_corrupted=x_corrupted,
+            baseline_corr_matrix=baseline_corr,
+        )
+
+        # Step 3: IRI. Hold out a random subset of originally observed entries
+        # before imputation, so the imputer cannot see values used to score IRI.
+        window_seed = int(corruption_loader.random_state or 0) + abs(int(ts_window[0])) + i + 104729
+        rng = np.random.default_rng(window_seed)
+        observed = mask.astype(bool)
+        eval_mask = (rng.random((T, K)) < iri_engine.holdout_frac) & observed
+        if observed.any() and not eval_mask.any():
+            candidates = np.argwhere(observed)
+            chosen = candidates[int(rng.integers(0, len(candidates)))]
+            eval_mask[tuple(chosen)] = True
+        iri_mask = mask.copy()
+        iri_mask[eval_mask] = 0
+        iri_corrupted = x_corrupted.copy()
+        iri_corrupted[eval_mask] = np.nan
+        ensemble_out = iri_engine.impute_ensemble(iri_corrupted, iri_mask)
+        iri_grid = iri_engine.compute_iri(
+            ensemble_out, window, eval_mask.astype(np.int8),
+        )
+        ensemble_mean = ensemble_out.mean(axis=0)
+        # Preserve genuinely observed values and fill only the injected gaps.
+        x_imputed = window.copy().astype(np.float32)
+        x_imputed[mask == 0] = ensemble_mean[mask == 0].astype(np.float32)
 
         # Step 4: Fuse DQA * IRI → DTI
         dti_grid = fusion_engine.compute_dti(dqa_score, iri_grid)  # (T, K)
@@ -435,7 +437,12 @@ def train_model(
 
             optimizer.zero_grad()
             mu, sigma, _ = model(x_imputed, dti_tensor)
-            loss, diagnostics = loss_fn(mu, sigma, target)
+            # Only the final input position predicts the next unseen timestep.
+            mu_forecast = mu[:, -1:, :]
+            sigma_forecast = sigma[:, -1:, :]
+            target_forecast = target[:, -1:, :]
+            dti_forecast = dti_tensor[:, -1:]
+            loss, diagnostics = loss_fn(mu_forecast, sigma_forecast, target_forecast)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
@@ -446,9 +453,10 @@ def train_model(
             epoch_nll_log_sigmas.append(diagnostics["nll_log_sigma"].item())
             epoch_nll_residuals.append(diagnostics["nll_residual"].item())
             base_sigma, inflation, z_rmse = batch_uncertainty_diagnostics(
-                model, mu, sigma, target, dti_tensor,
+                model, mu_forecast, sigma_forecast, target_forecast, dti_forecast,
             )
             epoch_base_sigmas.append(base_sigma); epoch_inflations.append(inflation); epoch_z_rmses.append(z_rmse)
+            epoch_maes.append(torch.mean(torch.abs(target_forecast - mu_forecast)).item())
         if len(epoch_losses) > 0:
             scheduler.step()
             avg_train_loss = float(np.mean(epoch_losses))
@@ -514,19 +522,23 @@ def train_model(
                 target = target.to(device)
                 dti_tensor = dti_tensor.to(device)
                 mu, sigma, _ = model(x_imputed, dti_tensor)
-                loss, diagnostics = loss_fn(mu, sigma, target)
+                mu_forecast = mu[:, -1:, :]
+                sigma_forecast = sigma[:, -1:, :]
+                target_forecast = target[:, -1:, :]
+                dti_forecast = dti_tensor[:, -1:]
+                loss, diagnostics = loss_fn(mu_forecast, sigma_forecast, target_forecast)
                 val_losses.append(loss.item())
                 val_nlls.append(diagnostics["nll"].item())
                 val_pinballs.append(diagnostics["calibration"].item())
                 val_nll_log_sigmas.append(diagnostics["nll_log_sigma"].item())
                 val_nll_residuals.append(diagnostics["nll_residual"].item())
                 base_sigma, inflation, z_rmse = batch_uncertainty_diagnostics(
-                    model, mu, sigma, target, dti_tensor,
+                    model, mu_forecast, sigma_forecast, target_forecast, dti_forecast,
                 )
                 val_base_sigmas.append(base_sigma)
                 val_inflations.append(inflation)
                 val_z_rmses.append(z_rmse)
-                val_maes.append(torch.mean(torch.abs(target - mu)).item())
+                val_maes.append(torch.mean(torch.abs(target_forecast - mu_forecast)).item())
 
         avg_val_loss = np.mean(val_losses) if val_losses else float("inf")
         avg_val_mae = np.mean(val_maes) if val_maes else float("inf")
@@ -687,25 +699,23 @@ def evaluate_model(
             dti_tensor = dti_tensor.to(device)
             mu, sigma, _ = model(x_imputed, dti_tensor)
 
-            all_mu.append(mu.cpu().numpy())
-            all_sigma.append(sigma.cpu().numpy())
-            all_target.append(target.cpu().numpy())
-            all_dti.append(dti_tensor.cpu().numpy())
+            # The final output predicts the next timestep beyond the input.
+            all_mu.append(mu[:, -1, :].cpu().numpy())
+            all_sigma.append(sigma[:, -1, :].cpu().numpy())
+            all_target.append(target[:, -1, :].cpu().numpy())
+            all_dti.append(dti_tensor[:, -1].cpu().numpy())
 
-    # Concatenate and flatten for scalar metrics
-    mu_all = np.concatenate(all_mu)        # (N, T, K)
-    sigma_all = np.concatenate(all_sigma)  # (N, T, K)
-    target_all = np.concatenate(all_target)  # (N, T, K)
-    dti_all = np.concatenate(all_dti)      # (N, T)
+    # Each row is one forecast origin; intermediate sequence outputs are not scored.
+    mu_all = np.concatenate(all_mu)        # (N_windows, K)
+    sigma_all = np.concatenate(all_sigma)  # (N_windows, K)
+    target_all = np.concatenate(all_target)  # (N_windows, K)
+    dti_all = np.concatenate(all_dti)      # (N_windows,)
 
-    # Flatten to 1-D for metric computation
-    y_flat = target_all.flatten()
-    mu_flat = mu_all.flatten()
-    raw_sigma_flat = sigma_all.flatten()
+    y_flat = target_all.reshape(-1)
+    mu_flat = mu_all.reshape(-1)
+    raw_sigma_flat = sigma_all.reshape(-1)
     sigma_flat = raw_sigma_flat * sigma_scale
-    # Per-sample DTI: broadcast (N, T) → (N, T, K) then flatten
-    dti_expanded = np.repeat(dti_all[:, :, np.newaxis], K, axis=2)
-    dti_flat = dti_expanded.flatten()
+    dti_flat = np.repeat(dti_all[:, np.newaxis], K, axis=1).reshape(-1)
 
     # ECE
     nominal_levels = np.array([0.50, 0.60, 0.70, 0.80, 0.90, 0.95])
@@ -807,7 +817,7 @@ def main(args: argparse.Namespace) -> None:
     )
     iri_engine = ImputationReliabilityEngine(
         n_features=n_features,
-        epochs=30,  # lighter for pipeline use
+        epochs=args.iri_epochs,
         holdout_frac=0.15,
         random_state=args.seed,
     )
@@ -914,7 +924,7 @@ def main(args: argparse.Namespace) -> None:
     model_calipred.sigma_lr_multiplier = args.sigma_lr_multiplier
 
     loss_fn = TrustCalibratedLoss(
-        lower_q=0.05, upper_q=0.95, calibration_weight=0.2,
+        lower_q=0.05, upper_q=0.95, calibration_weight=args.calibration_weight,
         beta_nll=args.beta_nll,
     )
 
@@ -1155,6 +1165,8 @@ def main(args: argparse.Namespace) -> None:
         baseline_mu=results_baseline["mu"],
         baseline_sigma=results_baseline["sigma"],
         baseline_dti=results_baseline["dti"],
+        prediction_unit=np.asarray("one_step_forecast"),
+        n_features=np.asarray(n_features, dtype=np.int64),
     )
     logger.info("Raw test predictions saved to '%s' (for bootstrap analysis).", pred_path)
 
@@ -1219,6 +1231,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sigma-init-bias", type=float, default=0.5,
         help="Initial bias for sigma head; softplus(0.5) ~ 1.07 (default: 0.5).",
+    )
+    parser.add_argument(
+        "--calibration-weight", type=float, default=0.2,
+        help="Weight for the pinball calibration term; keep fixed within an experiment.",
+    )
+    parser.add_argument(
+        "--iri-epochs", type=int, default=30,
+        help="Self-supervised imputer epochs per window (use 1 for smoke tests).",
     )
     parser.add_argument(
         "--beta-nll", type=float, default=0.0,
