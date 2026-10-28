@@ -195,7 +195,10 @@ class UpstreamDQAEngine:
     # ------------------------------------------------------------------ #
     # C_fresh: Freshness
     # ------------------------------------------------------------------ #
-    def freshness(self, timestamps: np.ndarray, inference_time: float) -> float:
+    def freshness(
+        self, timestamps: np.ndarray, inference_time: float,
+        observation_mask: Optional[np.ndarray] = None,
+    ) -> float:
         """
         Compute C_fresh: an exponentially-decaying normalized penalty on
         operational latency — the delay between the most recent sensor
@@ -235,14 +238,27 @@ class UpstreamDQAEngine:
         if valid_timestamps.size == 0:
             raise ValueError("timestamps contains no valid (non-NaN) entries.")
 
-        latest_timestamp = float(np.max(valid_timestamps))
-        # Clamp negative latency (e.g., minor clock skew, or a timestamp
-        # slightly ahead of inference_time) to zero rather than letting it
-        # produce a freshness score > 1.
-        latency = max(0.0, inference_time - latest_timestamp)
+        timestamps = np.asarray(timestamps, dtype=np.float64)
+        if observation_mask is None:
+            latest_by_channel = np.array([float(np.max(valid_timestamps))])
+        else:
+            mask = np.asarray(observation_mask)
+            if mask.ndim != 2 or mask.shape[0] != timestamps.shape[0]:
+                raise ValueError("observation_mask must have shape (T, K) matching timestamps.")
+            latest = []
+            for channel in range(mask.shape[1]):
+                valid = (mask[:, channel] > 0) & np.isfinite(timestamps)
+                # A channel with no observation is stale, not omitted.
+                latest.append(float(np.max(timestamps[valid])) if np.any(valid) else np.nan)
+            latest_by_channel = np.asarray(latest, dtype=np.float64)
 
-        c_fresh = float(np.exp(-latency / self.freshness_tau_seconds))
-        return float(np.clip(c_fresh, 0.0, 1.0))
+        has_observation = np.isfinite(latest_by_channel)
+        latencies = np.full(latest_by_channel.shape, np.inf, dtype=np.float64)
+        latencies[has_observation] = np.maximum(
+            0.0, float(inference_time) - latest_by_channel[has_observation]
+        )
+        scores = np.exp(-latencies / self.freshness_tau_seconds)
+        return float(np.clip(np.mean(scores), 0.0, 1.0))
 
     # ------------------------------------------------------------------ #
     # C_cons: Consistency
@@ -370,7 +386,7 @@ class UpstreamDQAEngine:
         w1, w2, w3 = self._validate_weights(weights) if weights is not None else self.weights
 
         c_comp = self.completeness(mask, window=window)
-        c_fresh = self.freshness(timestamps, inference_time)
+        c_fresh = self.freshness(timestamps, inference_time, observation_mask=mask)
         c_cons = self.consistency(X_corrupted, baseline_corr_matrix)
 
         raw_dqa = w1 * c_comp + w2 * c_fresh + w3 * c_cons
