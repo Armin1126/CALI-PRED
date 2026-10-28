@@ -540,11 +540,12 @@ class RealDataset(torch.utils.data.Dataset):
 
         if timestamp_col is not None:
             try:
-                ts_series = pd.to_datetime(df[timestamp_col])
-                # Convert to Unix seconds (float64)
-                self.timestamps = (
-                    ts_series.astype(np.int64).values / 1e9
-                ).astype(np.float64)
+                ts_series = pd.to_datetime(df[timestamp_col], errors="raise")
+                # pandas may infer datetime64[us] on newer versions. Force
+                # nanosecond resolution before converting to Unix seconds;
+                # otherwise dividing raw integer values by 1e9 is off by 1,000.
+                ts_ns = ts_series.astype("datetime64[ns]").astype(np.int64).to_numpy()
+                self.timestamps = (ts_ns / 1e9).astype(np.float64)
             except Exception:
                 self.timestamps = np.arange(len(df), dtype=np.float64)
         else:
@@ -807,10 +808,11 @@ def create_dataloaders(
             break
     if timestamp_col is not None:
         try:
-            ts_all = (
-                pd.to_datetime(df[timestamp_col])
-                .astype(np.int64).values / 1e9
-            ).astype(np.float64)
+            ts_series = pd.to_datetime(df[timestamp_col], errors="raise")
+            # Normalize pandas datetime resolution before converting to Unix
+            # seconds so pandas 2.x/3.x produce the same epoch values.
+            ts_ns = ts_series.astype("datetime64[ns]").astype(np.int64).to_numpy()
+            ts_all = (ts_ns / 1e9).astype(np.float64)
         except Exception:
             ts_all = np.arange(total_len, dtype=np.float64)
     else:
