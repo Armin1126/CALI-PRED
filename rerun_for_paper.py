@@ -36,85 +36,13 @@ USAGE (Colab)
 Add --skip-scaled to halve runtime if you only want the unscaled variant.
 """
 from __future__ import annotations
-import argparse, json, os, re, shutil, subprocess, sys
+import argparse, json, os, subprocess, sys
 
-CONTINUOUS = ("TP2", "TP3", "H1", "DV_pressure", "Reservoirs",
-              "Oil_temperature", "Motor_current")
-BINARY = ("COMP", "DV_eletric", "Towers", "MPG", "LPS",
-          "Pressure_switch", "Oil_level", "Caudal_impulses")
-CONTINUOUS_ONLY = True
 SEEDS = (42, 123, 456)
 
 
 def log(msg):
     print(f"\n>>> {msg}", flush=True)
-
-
-# ----------------------------------------------------------------------------
-# Patching
-# ----------------------------------------------------------------------------
-def backup(path):
-    b = path + ".orig"
-    if not os.path.exists(b):
-        shutil.copy2(path, b)
-    return b
-
-
-def patch_channels(path="data_loader.py"):
-    """Restrict _SUPPORTED_DATASETS['metropt'] to the continuous channels."""
-    backup(path)
-    src = open(path, encoding="utf-8").read()
-    pat = re.compile(r'("metropt"\s*:\s*\()(.*?)(\)\s*,)', re.S)
-    m = pat.search(src)
-    if not m:
-        sys.exit("PATCH FAILED: could not locate _SUPPORTED_DATASETS['metropt'].")
-    cols = CONTINUOUS if CONTINUOUS_ONLY else CONTINUOUS + BINARY
-    body = "\n        " + ", ".join(f'"{c}"' for c in cols) + ",\n    "
-    src2 = src[:m.start()] + m.group(1) + body + m.group(3) + src[m.end():]
-    open(path, "w", encoding="utf-8").write(src2)
-
-    check = re.search(r'"metropt"\s*:\s*\((.*?)\)\s*,', src2, re.S).group(1)
-    found = re.findall(r'"([^"]+)"', check)
-    if list(found) != list(cols):
-        sys.exit(f"PATCH VERIFY FAILED: got {found}")
-    log(f"patched {path}: {len(found)} channels -> {found}")
-
-
-def patch_calibration_weight(path="pipeline.py"):
-    """Expose calibration_weight as a CLI argument instead of hard-coding 0.2."""
-    backup(path)
-    src = open(path, encoding="utf-8").read()
-
-    if "args.calibration_weight" not in src:
-        n = src.count("calibration_weight=0.2")
-        if n != 1:
-            sys.exit(f"PATCH FAILED: expected one 'calibration_weight=0.2', found {n}.")
-        src = src.replace("calibration_weight=0.2",
-                          "calibration_weight=args.calibration_weight")
-
-    if "--calibration-weight" not in src:
-        anchor = '    parser.add_argument(\n        "--seed", type=int, default=42,'
-        if anchor not in src:
-            anchor2 = 'parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")'
-            if anchor2 not in src:
-                sys.exit("PATCH FAILED: no anchor for the new argument.")
-            src = src.replace(
-                anchor2,
-                anchor2 + '\n    parser.add_argument("--calibration-weight", type=float,'
-                          ' default=0.10,\n                        help="Pinball calibration'
-                          ' weight in TrustCalibratedLoss.")')
-        else:
-            src = src.replace(
-                anchor,
-                '    parser.add_argument("--calibration-weight", type=float, default=0.10,\n'
-                '                        help="Pinball calibration weight in'
-                ' TrustCalibratedLoss.")\n' + anchor)
-
-    open(path, "w", encoding="utf-8").write(src)
-    src2 = open(path, encoding="utf-8").read()
-    if "args.calibration_weight" not in src2 or "--calibration-weight" not in src2:
-        sys.exit("PATCH VERIFY FAILED: calibration weight not wired up.")
-    log(f"patched {path}: calibration_weight is now a CLI argument (default 0.10)")
 
 
 # ----------------------------------------------------------------------------
