@@ -219,10 +219,10 @@ def main():
     ap.add_argument("--stride", default="100")
     ap.add_argument("--epochs", default="25")
     ap.add_argument("--sigma-floor", default="0.10")
-    ap.add_argument("--calibration-weight", default="0.10")
+    ap.add_argument("--calibration-weight", default="0.2")
     ap.add_argument("--max-windows", default=None)
     ap.add_argument("--skip-scaled", action="store_true")
-    ap.add_argument("--skip-patch", action="store_true")
+    ap.add_argument("--skip-patch", action="store_true", help="Deprecated; source files are never patched.")
     a = ap.parse_args()
 
     if not os.path.exists("pipeline.py"):
@@ -230,15 +230,11 @@ def main():
     if not os.path.exists(a.data_path):
         sys.exit(f"data not found: {a.data_path}")
 
-    log("PATCHING")
-    if not a.skip_patch:
-        patch_channels()
-        patch_calibration_weight()
-    else:
-        log("skipped (--skip-patch)")
+    log("SAFE MODE: source files are never patched in place.")
+    log("Primary run retains the repository's 15-channel MetroPT schema. "
+        "Seven-channel runs must be implemented as a separate, explicitly configured ablation.")
 
-    log(f"RUN A: unscaled  (cw={a.calibration_weight}, "
-        f"{'continuous only' if CONTINUOUS_ONLY else 'all 15 channels'})")
+    log(f"RUN A: unscaled primary setup (15-channel schema, cw={a.calibration_weight})")
     paths_u = run_seeds(a, "checkpoints_paper_unscaled", scaled=False)
     res = {"unscaled": summarize(paths_u, "UNSCALED  (report this as the method)")}
 
@@ -247,16 +243,11 @@ def main():
         paths_s = run_seeds(a, "checkpoints_paper_scaled", scaled=True)
         res["scaled"] = summarize(paths_s, "WITH VALIDATION SIGMA SCALING")
 
-    log("EXTERNAL BASELINES + BOOTSTRAP (unscaled predictions)")
-    for script, args_ in [("benchmark_external_baselines.py", []),
-                          ("bootstrap_analysis.py", []),
-                          ("coverage_diagnostics.py", [])]:
-        if os.path.exists(script):
-            try:
-                run([sys.executable, script] + args_ + paths_u)
-            except SystemExit:
-                print(f"    ({script} did not accept those arguments -- "
-                      f"run it manually on checkpoints_paper_unscaled/)")
+    log("EXTERNAL BASELINES + BOOTSTRAP + COVERAGE DIAGNOSTICS (unscaled predictions)")
+    run([sys.executable, "benchmark_external_baselines.py", "--pred-paths", *paths_u])
+    run([sys.executable, "bootstrap_analysis.py", "--bootstrap-only", "--pred-paths", *paths_u])
+    for prediction_path in paths_u:
+        run([sys.executable, "coverage_diagnostics.py", "--pred-path", prediction_path])
 
     with open("paper_numbers.json", "w") as f:
         json.dump(res, f, indent=2)
