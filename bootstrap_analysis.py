@@ -60,8 +60,25 @@ def _precompute_window_metrics(
     from scipy.stats import norm
     import math
 
+    y_true, mu, sigma = [np.asarray(a).reshape(-1) for a in (y_true, mu, sigma)]
+    if not (len(y_true) == len(mu) == len(sigma)):
+        raise ValueError("y_true, mu, and sigma must have identical lengths.")
+    if len(y_true) == 0 or not (
+        np.isfinite(y_true).all() and np.isfinite(mu).all() and np.isfinite(sigma).all()
+    ):
+        raise ValueError("Prediction arrays must be non-empty and finite.")
+    if np.any(sigma <= 0):
+        raise ValueError("sigma must be strictly positive.")
+    if window_size < 1 or n_features < 1:
+        raise ValueError("window_size and n_features must be positive integers.")
+
     block_size = window_size * n_features
     N = len(y_true)
+    if N % block_size != 0:
+        raise ValueError(
+            f"Prediction count {N} is not divisible by block size {block_size}; "
+            "check prediction_unit, window_size, and n_features."
+        )
     N_windows = N // block_size
 
     y_t = y_true[:N_windows * block_size].reshape(N_windows, block_size)
@@ -198,6 +215,15 @@ def run_bootstrap_analysis(
     """Run bootstrap CI analysis on saved predictions using a block window bootstrap."""
 
     data = np.load(pred_path)
+    if "prediction_unit" in data.files and str(data["prediction_unit"].item()) == "one_step_forecast":
+        window_size = 1
+        if "n_features" in data.files:
+            stored_features = int(data["n_features"].item())
+            if n_features not in (15, stored_features):
+                raise ValueError(
+                    f"CLI n_features={n_features} does not match saved artifact n_features={stored_features}."
+                )
+            n_features = stored_features
     y_true_c = data["calipred_y_true"]
     mu_c = data["calipred_mu"]
     sigma_c = data["calipred_sigma"]
@@ -205,16 +231,16 @@ def run_bootstrap_analysis(
     mu_b = data["baseline_mu"]
     sigma_b = data["baseline_sigma"]
 
-    # Verify y_true is the same for both
-    assert np.allclose(y_true_c, y_true_b), (
-        "CALI-PRED and Baseline must be evaluated on the same test set."
-    )
+    if not (len(y_true_c) == len(mu_c) == len(sigma_c) == len(y_true_b) == len(mu_b) == len(sigma_b)):
+        raise ValueError("CALI-PRED and baseline prediction arrays must have identical lengths.")
+    if not np.allclose(y_true_c, y_true_b):
+        raise ValueError("CALI-PRED and baseline must use identical test targets.")
     y_true = y_true_c
     N = len(y_true)
 
     print("\n" + "=" * 70)
     print("  WINDOW-BLOCK BOOTSTRAP CONFIDENCE INTERVAL ANALYSIS")
-    print(f"  N={N} samples ({N // (window_size * n_features)} window blocks), B={n_bootstrap} resamples, {confidence:.0%} CI")
+    print(f"  N={N} scalar targets ({N // (window_size * n_features)} forecast/window blocks), B={n_bootstrap} resamples, {confidence:.0%} CI")
     print("=" * 70)
 
     rng = np.random.default_rng(42)
@@ -249,7 +275,7 @@ def run_bootstrap_analysis(
 
         # Interpret significance
         if ci_diff["ci_lower"] > 0:
-            print(f"  -> CALI-PRED {label} is SIGNIFICANTLY HIGHER (worse for ECE)")
+            print(f"  -> CALI-PRED {label} is SIGNIFICANTLY HIGHER (worse for {label})")
         elif ci_diff["ci_upper"] < 0:
             print(f"  -> CALI-PRED {label} is SIGNIFICANTLY LOWER (better)")
         else:
