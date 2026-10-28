@@ -333,7 +333,6 @@ class ImputationReliabilityEngine:
             _BRITSStub(self.n_features, hidden_size=self.d_model).to(self.device),
         )
         optimizers = [torch.optim.Adam(m.parameters(), lr=self.lr) for m in models]
-        loss_fn = nn.MSELoss()
         total_steps = n_epochs * len(loader)
         step = 0
         started = time.time()
@@ -353,7 +352,8 @@ class ImputationReliabilityEngine:
                     model.train()
                     optimizers[j].zero_grad(set_to_none=True)
                     pred = model(x_batch, train_mask)
-                    loss = loss_fn(pred * holdout, x_batch * holdout)
+                    squared_error = (pred - x_batch).square() * holdout
+                    loss = squared_error.sum() / holdout.sum().clamp_min(1.0)
                     loss.backward()
                     optimizers[j].step()
                     loss_sums[j] += float(loss.detach().item())
