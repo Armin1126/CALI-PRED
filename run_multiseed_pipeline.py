@@ -39,6 +39,9 @@ def main():
     parser.add_argument("--sigma-floor", type=float, default=0.10)
     parser.add_argument("--sigma-lr-multiplier", type=float, default=0.50)
     parser.add_argument("--sigma-init-bias", type=float, default=0.50)
+    parser.add_argument("--calibration-weight", type=float, default=0.2)
+    parser.add_argument("--apply-validation-sigma-scaling", action="store_true",
+                        help="Fit a post-hoc sigma scale on validation data; disabled by default.")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     args = parser.parse_args()
 
@@ -63,9 +66,11 @@ def main():
             "--sigma-floor", str(args.sigma_floor),
             "--sigma-lr-multiplier", str(args.sigma_lr_multiplier),
             "--sigma-init-bias", str(args.sigma_init_bias),
-            "--apply-validation-sigma-scaling",
+            "--calibration-weight", str(args.calibration_weight),
             "--seed", str(seed),
         ]
+        if args.apply_validation_sigma_scaling:
+            cmd.append("--apply-validation-sigma-scaling")
         if args.max_windows is not None:
             cmd.extend(["--max-windows", str(args.max_windows)])
 
