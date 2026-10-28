@@ -156,36 +156,19 @@ class IndustrialDataLoader:
             )
         expected_cols = list(_SUPPORTED_DATASETS[key])
 
-        # Resolve file path if specified file doesn't exist but an alternative MetroPT/IIoT CSV exists in the same directory
-        if not os.path.exists(file_path):
-            dir_name = os.path.dirname(file_path)
-            if dir_name and os.path.exists(dir_name):
-                candidates = [
-                    os.path.join(dir_name, f) for f in os.listdir(dir_name)
-                    if f.endswith(".csv")
-                ]
-                if candidates:
-                    logger.info("Specified path '%s' not found. Auto-detected available CSV in directory: '%s'", file_path, candidates[0])
-                    file_path = candidates[0]
-
-        is_mock = False
         try:
             df = pd.read_csv(file_path)
-            if len(df) < 5000:
-                logger.warning("Loaded CSV from '%s' has only %d rows (expected >50,000 for real data).", file_path, len(df))
-            else:
-                logger.info("=" * 80)
-                logger.info("[DATA VALIDATION CONFIRMED] REAL DATASET LOADED: '%s'", file_path)
-                logger.info("  -> Total timesteps: %d rows | Sensor channels: %d columns", df.shape[0], df.shape[1])
-                logger.info("=" * 80)
-        except (FileNotFoundError, OSError) as exc:
-            is_mock = True
-            logger.error("=" * 80)
-            logger.error("!!! [CRITICAL WARNING] MOCK DATA FALLBACK ACTIVATED !!!")
-            logger.error("!!! Could not read '%s' (%s). !!!", file_path, exc)
-            logger.error("!!! Using synthetic 2,000-timestep mock data for pipeline dry-run validation ONLY. !!!")
-            logger.error("=" * 80)
-            df = self._generate_mock_dataframe(key, expected_cols)
+        except (FileNotFoundError, OSError, pd.errors.ParserError) as exc:
+            raise FileNotFoundError(
+                f"Could not load the requested dataset at '{file_path}'. "
+                "Paper/training runs fail closed instead of silently substituting synthetic data. "
+                "For a dry run, call _generate_mock_dataframe explicitly in a test."
+            ) from exc
+
+        if len(df) < 5000:
+            logger.warning("Loaded CSV from '%s' has only %d rows; verify that this is the intended dataset.", file_path, len(df))
+        else:
+            logger.info("[DATA VALIDATION CONFIRMED] Loaded '%s': %d rows, %d columns.", file_path, df.shape[0], df.shape[1])
 
         missing_expected = [c for c in expected_cols if c not in df.columns]
         if missing_expected:
@@ -538,6 +521,12 @@ class RealDataset(torch.utils.data.Dataset):
                 f"dataset '{dataset_name}'. Expected: {expected_cols}. "
                 f"Found: {list(df.columns)}."
             )
+        missing_cols = [col for col in expected_cols if col not in resolved_cols]
+        if missing_cols:
+            raise ValueError(
+                f"Dataset schema mismatch for '{file_path}': missing expected "
+                f"channels {missing_cols}. Refusing to train/evaluate on a silent subset."
+            )
 
         self.sensor_cols = resolved_cols
         self.n_features = len(resolved_cols)
@@ -562,9 +551,11 @@ class RealDataset(torch.utils.data.Dataset):
             self.timestamps = np.arange(len(df), dtype=np.float64)
 
         # --- Normalize ------------------------------------------------------ #
-        sensor_df = df[resolved_cols].copy()
-        # Drop rows with NaNs in sensor columns (real data may have some)
-        sensor_df = sensor_df.dropna().reset_index(drop=True)
+        sensor_valid_rows = df[resolved_cols].notna().all(axis=1).to_numpy()
+        sensor_df = df.loc[sensor_valid_rows, resolved_cols].reset_index(drop=True)
+        # Apply the identical row mask to timestamps; truncating timestamps
+        # after dropna would misalign every row after the first dropped row.
+        self.timestamps = self.timestamps[sensor_valid_rows]
 
         if scaler is not None:
             self.scaler = scaler
@@ -577,8 +568,8 @@ class RealDataset(torch.utils.data.Dataset):
                 sensor_df.to_numpy(dtype=np.float64)
             ).astype(np.float32)
 
-        # Trim timestamps to match cleaned data
-        self.timestamps = self.timestamps[: len(self.X)]
+        if len(self.timestamps) != len(self.X):
+            raise RuntimeError("Timestamp/sensor row alignment failed after cleaning.")
 
         # --- Create windows ------------------------------------------------- #
         self._create_windows()
@@ -740,7 +731,14 @@ def create_dataloaders(
     if col_renames:
         df = df.rename(columns=col_renames)
 
-    sensor_df = df[resolved_cols].dropna().reset_index(drop=True)
+    missing_cols = [col for col in expected_cols if col not in resolved_cols]
+    if missing_cols:
+        raise ValueError(
+            f"Dataset schema mismatch for '{file_path}': missing expected "
+            f"channels {missing_cols}. Refusing to train/evaluate on a silent subset."
+        )
+    valid_sensor_rows = df[resolved_cols].notna().all(axis=1).to_numpy()
+    sensor_df = df.loc[valid_sensor_rows, resolved_cols].reset_index(drop=True)
     total_len = len(sensor_df)
 
     train_end = int(total_len * train_frac)
@@ -817,7 +815,9 @@ def create_dataloaders(
             ts_all = np.arange(total_len, dtype=np.float64)
     else:
         ts_all = np.arange(total_len, dtype=np.float64)
-    ts_all = ts_all[:total_len]
+    ts_all = ts_all[valid_sensor_rows]
+    if len(ts_all) != total_len:
+        raise RuntimeError("Timestamp/sensor row alignment failed in create_dataloaders.")
 
     X_train = train_scaler.transform(full_array[:train_end])
     X_val = train_scaler.transform(full_array[train_end:val_end])
