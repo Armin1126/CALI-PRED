@@ -166,7 +166,7 @@ def compute_dti_for_batch(
             X_corrupted=x_corrupted, baseline_corr_matrix=baseline_corr,
         )
 
-        window_seed = int(corruption_loader.random_state or 0) + abs(int(ts_window[0])) + i + 104729
+        window_seed = int(corruption_loader.random_state or 0) + abs(int(ts_window[0])) + 104729
         rng = np.random.default_rng(window_seed)
         observed = mask.astype(bool)
         eval_mask = (rng.random((T, K)) < iri_engine.holdout_frac) & observed
