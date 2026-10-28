@@ -551,10 +551,11 @@ class ImputationReliabilityEngine:
         """
         Compute the Midstream Imputation Reliability Indicator (IRI):
 
-            IRI(t, k) = (sigma_ens(t, k) + eps)^-1 * (1 - epsilon_recon)
+            IRI(t, k) = (1 - epsilon_recon) / (1 + sigma_ens(t, k))
 
-        followed by global min-max normalization to [0, 1] across the
-        full (T, K) grid.
+        The score is bounded in [0, 1] and is not normalized separately
+        within each window, so reconstruction quality remains meaningful
+        and scores can be compared across windows.
 
         Interpretation
         --------------
@@ -618,30 +619,20 @@ class ImputationReliabilityEngine:
             x_imputed_mean, X_ground_truth, evaluation_mask
         )  # scalar, applied uniformly across the grid
 
-        raw_iri = (1.0 / (sigma_ens + eps)) * (1.0 - epsilon_recon)
-
-        # Global min-max normalization to [0, 1]. Guard against a
-        # degenerate all-equal raw_iri grid (would divide by zero range).
-        iri_min, iri_max = float(raw_iri.min()), float(raw_iri.max())
-        value_range = iri_max - iri_min
-        if value_range < 1e-12:
-            logger.warning(
-                "compute_iri: raw IRI grid is (near-)constant (min=%.6f, "
-                "max=%.6f); returning a uniform mid-trust grid of 0.5.",
-                iri_min, iri_max,
-            )
-            return np.full_like(raw_iri, fill_value=0.5)
-
-        iri_normalized = (raw_iri - iri_min) / value_range
+        # Do not min-max normalize within a window: that cancels the
+        # global reconstruction penalty and forces every non-constant window
+        # to span [0, 1]. Standardized input channels make this bounded mapping
+        # interpretable across windows.
+        iri_score = (1.0 - epsilon_recon) / (1.0 + np.maximum(sigma_ens, 0.0))
+        iri_score = np.clip(iri_score, 0.0, 1.0)
         logger.info(
             "Computed IRI grid: shape=%s, epsilon_recon=%.4f, "
-            "sigma_ens range=[%.4f, %.4f], IRI range=[0, 1] "
-            "(pre-normalization range was [%.4f, %.4f]).",
-            iri_normalized.shape, epsilon_recon,
+            "ensemble variance range=[%.4f, %.4f], IRI range=[%.4f, %.4f].",
+            iri_score.shape, epsilon_recon,
             float(sigma_ens.min()), float(sigma_ens.max()),
-            iri_min, iri_max,
+            float(iri_score.min()), float(iri_score.max()),
         )
-        return iri_normalized
+        return iri_score
 
     # ------------------------------------------------------------------ #
     # 5. Batched ensemble imputation
