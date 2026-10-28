@@ -4,6 +4,8 @@ An End-to-End Trust-Conditioned Framework for Robust Industrial Time-Series Fore
 
 ---
 
+> **Reproducibility status:** This report and its existing figures/prediction summaries describe an earlier implementation. The corrected pipeline now evaluates a genuine one-step-ahead forecast using only the final output position, validates IRI on values hidden from the imputer, and changes the absolute IRI normalization. Regenerate all model outputs and figures before treating any previously reported metric as a result of the corrected implementation. See [REPRODUCIBILITY_FIXES.md](./REPRODUCIBILITY_FIXES.md).
+
 ## 1. Executive Summary
 
 In modern time-series anomaly detection pipelines, sensor degradation—caused by physical sensor faults, network dropouts, or packet loss—frequently disrupts the raw data stream. Standard industrial time-series models typically paper over these gaps using imputation (e.g., SAITS, BRITS). However, downstream predictors consume these imputed reconstructions as if they were ground truth, resulting in **blind trust**. During dropouts, a model may predict high-precision intervals with narrow, confident bounds, leading to catastrophic undetected failures or high false alarm rates.
