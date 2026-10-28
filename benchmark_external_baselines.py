@@ -96,8 +96,13 @@ def evaluate_baselines_on_predictions(npz_path: str):
     }
 
 def main():
-    candidate_paths = glob.glob("checkpoints/seed_*/test_predictions.npz")
-    if not candidate_paths:
+    import argparse
+    parser = argparse.ArgumentParser(description="Compare calibration baselines on saved predictions.")
+    parser.add_argument("--pred-paths", nargs="+", default=None,
+                        help="Explicit prediction NPZ files. Defaults to checkpoints/seed_*/test_predictions.npz.")
+    args = parser.parse_args()
+    candidate_paths = args.pred_paths or glob.glob("checkpoints/seed_*/test_predictions.npz")
+    if not candidate_paths and args.pred_paths is None:
         candidate_paths = glob.glob("checkpoints/test_predictions.npz")
         
     if not candidate_paths:
