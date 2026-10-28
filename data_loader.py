@@ -544,7 +544,10 @@ class RealDataset(torch.utils.data.Dataset):
                 # pandas may infer datetime64[us] on newer versions. Force
                 # nanosecond resolution before converting to Unix seconds;
                 # otherwise dividing raw integer values by 1e9 is off by 1,000.
-                ts_ns = ts_series.astype("datetime64[ns]").astype(np.int64).to_numpy()
+                # Convert through a NumPy datetime64[ns] array so the
+                # integer representation is guaranteed to be nanoseconds,
+                # independent of pandas' inferred datetime unit.
+                ts_ns = ts_series.to_numpy(dtype="datetime64[ns]").astype(np.int64)
                 self.timestamps = (ts_ns / 1e9).astype(np.float64)
             except Exception:
                 self.timestamps = np.arange(len(df), dtype=np.float64)
@@ -811,7 +814,9 @@ def create_dataloaders(
             ts_series = pd.to_datetime(df[timestamp_col], errors="raise")
             # Normalize pandas datetime resolution before converting to Unix
             # seconds so pandas 2.x/3.x produce the same epoch values.
-            ts_ns = ts_series.astype("datetime64[ns]").astype(np.int64).to_numpy()
+            # Force NumPy nanosecond datetime dtype before integer conversion;
+            # pandas Series integer casting can retain its original unit.
+            ts_ns = ts_series.to_numpy(dtype="datetime64[ns]").astype(np.int64)
             ts_all = (ts_ns / 1e9).astype(np.float64)
         except Exception:
             ts_all = np.arange(total_len, dtype=np.float64)
