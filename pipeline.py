@@ -143,64 +143,54 @@ def compute_dti_for_batch(
     B, T, K = x_batch.shape
     dti_batch = np.empty((B, T), dtype=np.float64)
     x_imputed_batch = np.empty_like(x_batch, dtype=np.float32)
+    corrupted_windows = np.empty_like(x_batch, dtype=np.float32)
+    iri_masks = np.empty_like(x_batch, dtype=np.int8)
+    eval_masks = np.zeros_like(x_batch, dtype=np.int8)
+    original_masks = np.empty_like(x_batch, dtype=np.int8)
+    dqa_batch = np.empty((B, T, K), dtype=np.float64)
 
+    # DQA is window-specific. Prepare corruption and DQA first, then run
+    # both reusable imputers over the complete minibatch in one inference call.
     for i in range(B):
-        window = x_batch[i]  # (T, K)
-        ts_window = ts_batch[i]  # (T,)
-
-        # Step 1: Inject missingness
-        window_missing_rate = missing_rate
-        if missing_rate_sampler is not None:
-            window_missing_rate = missing_rate_sampler()
-
-        if window_missing_rate == 0.0:
-            x_corrupted = window.copy()
-            mask = np.ones_like(window, dtype=np.int8)
+        window, ts_window = x_batch[i], ts_batch[i]
+        rate = missing_rate_sampler() if missing_rate_sampler is not None else missing_rate
+        if rate == 0.0:
+            x_corrupted, mask = window.copy(), np.ones_like(window, dtype=np.int8)
         else:
             x_corrupted, mask = corruption_loader.inject_missingness(
-                window, mechanism="MAR", missing_rate=window_missing_rate,
-                block_size=block_size,
+                window, mechanism="MAR", missing_rate=rate, block_size=block_size,
             )
-
-        # Step 2: DQA. For offline data, assume a fixed 0.5 s processing delay.
-        inference_time = float(ts_window[-1]) + 0.5
-        dqa_score = dqa_engine.compute_dqa_score(
-            mask=mask,
-            timestamps=ts_window,
-            inference_time=inference_time,
-            X_corrupted=x_corrupted,
-            baseline_corr_matrix=baseline_corr,
+        original_masks[i] = mask
+        dqa_batch[i] = dqa_engine.compute_dqa_score(
+            mask=mask, timestamps=ts_window, inference_time=float(ts_window[-1]) + 0.5,
+            X_corrupted=x_corrupted, baseline_corr_matrix=baseline_corr,
         )
 
-        # Step 3: IRI. Hold out a random subset of originally observed entries
-        # before imputation, so the imputer cannot see values used to score IRI.
         window_seed = int(corruption_loader.random_state or 0) + abs(int(ts_window[0])) + i + 104729
         rng = np.random.default_rng(window_seed)
         observed = mask.astype(bool)
         eval_mask = (rng.random((T, K)) < iri_engine.holdout_frac) & observed
         if observed.any() and not eval_mask.any():
             candidates = np.argwhere(observed)
-            chosen = candidates[int(rng.integers(0, len(candidates)))]
-            eval_mask[tuple(chosen)] = True
+            eval_mask[tuple(candidates[int(rng.integers(0, len(candidates)))])] = True
         iri_mask = mask.copy()
         iri_mask[eval_mask] = 0
-        iri_corrupted = x_corrupted.copy()
-        iri_corrupted[eval_mask] = np.nan
-        ensemble_out = iri_engine.impute_ensemble(iri_corrupted, iri_mask)
-        iri_grid = iri_engine.compute_iri(
-            ensemble_out, window, eval_mask.astype(np.int8),
-        )
-        ensemble_mean = ensemble_out.mean(axis=0)
-        # Preserve genuinely observed values and fill only the injected gaps.
+        iri_input = x_corrupted.astype(np.float32, copy=True)
+        iri_input[eval_mask] = np.nan
+        corrupted_windows[i] = np.nan_to_num(iri_input, nan=0.0)
+        iri_masks[i] = iri_mask
+        eval_masks[i] = eval_mask.astype(np.int8)
+
+    ensemble_batch = iri_engine.impute_ensemble_batch(corrupted_windows, iri_masks)
+    for i in range(B):
+        window = x_batch[i]
+        ensemble_out = ensemble_batch[:, i, :, :]
+        iri_grid = iri_engine.compute_iri(ensemble_out, window, eval_masks[i])
         x_imputed = window.copy().astype(np.float32)
-        x_imputed[mask == 0] = ensemble_mean[mask == 0].astype(np.float32)
-
-        # Step 4: Fuse DQA * IRI → DTI
-        dti_grid = fusion_engine.compute_dti(dqa_score, iri_grid)  # (T, K)
-        # Average across channels to get per-timestep DTI for the Transformer
-        dti_per_timestep = np.mean(dti_grid, axis=1)  # (T,)
-
-        dti_batch[i] = dti_per_timestep
+        missing = original_masks[i] == 0
+        x_imputed[missing] = ensemble_out.mean(axis=0)[missing].astype(np.float32)
+        dti_grid = fusion_engine.compute_dti(dqa_batch[i], iri_grid)
+        dti_batch[i] = np.mean(dti_grid, axis=1)
         x_imputed_batch[i] = x_imputed
 
     return dti_batch, x_imputed_batch
@@ -285,7 +275,9 @@ def precompute_trust_and_imputed(
     )
     start_time = time.time()
 
-    for x_batch, _, ts_batch in loader:
+    total_batches = len(loader)
+    completed_windows = 0
+    for batch_idx, (x_batch, _, ts_batch) in enumerate(loader, start=1):
         dti_batch, x_imputed_batch = compute_dti_for_batch(
             x_batch.numpy(), ts_batch.numpy(), n_features,
             dqa_engine, iri_engine, fusion_engine,
@@ -295,6 +287,17 @@ def precompute_trust_and_imputed(
         )
         all_dti.append(dti_batch)
         all_imputed.append(x_imputed_batch)
+        completed_windows += len(x_batch)
+        if batch_idx == 1 or batch_idx % max(1, total_batches // 20) == 0 or batch_idx == total_batches:
+            elapsed_now = time.time() - start_time
+            rate = completed_windows / max(elapsed_now, 1e-9)
+            eta = (len(dataset) - completed_windows) / max(rate, 1e-9)
+            logger.info(
+                "Precompute progress: %d/%d windows (%.1f%%), batch %d/%d, "
+                "elapsed %.1fs, %.2f windows/s, ETA %.1fs.",
+                completed_windows, len(dataset), 100.0 * completed_windows / len(dataset),
+                batch_idx, total_batches, elapsed_now, rate, eta,
+            )
 
     elapsed = time.time() - start_time
     logger.info("Finished precomputation in %.2f seconds.", elapsed)
@@ -849,7 +852,29 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # ------------------------------------------------------------------ #
-    # 3. Precompute DTI and Imputed Sequences (Caching)
+    # 3. Fit reusable imputers on TRAIN only, then precompute all splits.
+    # ------------------------------------------------------------------ #
+    logger.info("Collecting training windows for reusable IRI fitting...")
+    fit_start = time.time()
+    fit_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
+    )
+    train_window_batches = []
+    fit_seen = 0
+    for fit_idx, (x_fit, _, _) in enumerate(fit_loader, start=1):
+        train_window_batches.append(x_fit.numpy())
+        fit_seen += len(x_fit)
+        if fit_idx == 1 or fit_idx % 20 == 0 or fit_seen == len(train_ds):
+            logger.info("Collected IRI fit windows: %d/%d.", fit_seen, len(train_ds))
+    train_windows = np.concatenate(train_window_batches, axis=0)
+    iri_engine.fit_reusable_ensemble(
+        train_windows, batch_size=args.batch_size, epochs=args.iri_epochs,
+    )
+    del train_windows, train_window_batches
+    logger.info("Reusable IRI fitting completed in %.1fs.", time.time() - fit_start)
+
+    # ------------------------------------------------------------------ #
+    # 4. Precompute DTI and Imputed Sequences (Caching)
     # ------------------------------------------------------------------ #
     # Precompute train split
     train_dti, train_imputed = precompute_trust_and_imputed(
