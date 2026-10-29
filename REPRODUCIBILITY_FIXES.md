@@ -31,3 +31,19 @@ The default primary setup retains the 15-channel schema and calibration weight 0
 ## Validation scope
 
 The automated tests cover target alignment, timestamp preservation, stale-channel freshness, IRI reconstruction-penalty sensitivity, and the one-step prediction artifact contract. A full MetroPT run is still required before reporting corrected research metrics.
+
+
+## Runtime optimization: reusable IRI ensemble
+
+The pipeline fits the SAITS-style and BRITS-style imputers once using only
+training-split windows and self-supervised random holdouts. Fitted models are
+reused for batched inference while DQA remains window-specific. This removes
+per-window neural-network initialization and optimization from preprocessing.
+It is a methodological change from the legacy per-window fitting protocol:
+training-window IRI is estimated by models fitted on the training split, while
+validation/test windows are processed by inference only. Regenerate metrics and
+report results under this updated protocol.
+
+Precomputation logs report completed windows, percentage, elapsed time,
+throughput, and ETA. Reusable IRI fitting reports batch progress and elapsed
+time. Full MetroPT runs remain necessary before reporting research results.

@@ -63,6 +63,7 @@ Python: 3.13+
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional, Tuple
 
 import numpy as np
@@ -247,9 +248,8 @@ class ImputationReliabilityEngine:
         Hidden width shared by both stub architectures (kept equal for
         a fair, complexity-matched ensemble comparison).
     epochs : int, default 150
-        Number of self-supervised training iterations per model per call
-        to :meth:`impute_ensemble`. Kept small by default so the module
-        runs quickly in a CI/demo context; increase for production use.
+        Number of self-supervised training epochs when fitting the reusable
+        ensemble. Pipeline runs fit once on training windows and reuse it.
     lr : float, default 1e-3
         Adam learning rate for the internal self-supervised fit.
     holdout_frac : float, default 0.1
@@ -296,9 +296,90 @@ class ImputationReliabilityEngine:
         # = BRITS-style. Downstream code should rely on this ordering
         # rather than re-deriving it.
         self.model_names: Tuple[str, str] = ("SAITS", "BRITS")
+        # Fitted once on training-split windows; reused for all later inference.
+        self._fitted_models: Optional[Tuple[nn.Module, nn.Module]] = None
 
     # ------------------------------------------------------------------ #
-    # 1. Ensemble imputation
+    # 1. Fit once, then reuse for all split/window inference
+    # ------------------------------------------------------------------ #
+    def fit_reusable_ensemble(
+        self, X_train: np.ndarray, batch_size: int = 128,
+        epochs: Optional[int] = None,
+    ) -> None:
+        """Fit both imputers once on training-split windows using masked MSE.
+
+        Pass only clean, standardized windows from the training split. Validation
+        and test data are never used to fit these models.
+        """
+        if X_train.ndim != 3 or X_train.shape[-1] != self.n_features:
+            raise ValueError(
+                f"X_train must have shape (N, T, {self.n_features}); got {X_train.shape}."
+            )
+        if len(X_train) == 0 or batch_size < 1:
+            raise ValueError("X_train must be non-empty and batch_size must be positive.")
+        if not np.isfinite(X_train).all():
+            raise ValueError("X_train contains non-finite values.")
+        n_epochs = self.epochs if epochs is None else int(epochs)
+        if n_epochs < 1:
+            raise ValueError("epochs must be at least 1.")
+
+        x_cpu = torch.as_tensor(X_train, dtype=torch.float32)
+        loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(x_cpu), batch_size=batch_size,
+            shuffle=True, drop_last=False,
+        )
+        models = (
+            _SAITSStub(self.n_features, d_model=self.d_model).to(self.device),
+            _BRITSStub(self.n_features, hidden_size=self.d_model).to(self.device),
+        )
+        optimizers = [torch.optim.Adam(m.parameters(), lr=self.lr) for m in models]
+        total_steps = n_epochs * len(loader)
+        step = 0
+        started = time.time()
+        logger.info(
+            "Fitting reusable IRI ensemble on %d training windows (batch_size=%d, epochs=%d, device=%s).",
+            len(X_train), batch_size, n_epochs, self.device,
+        )
+        for epoch in range(n_epochs):
+            loss_sums = [0.0, 0.0]
+            seen = 0
+            for (x_cpu_batch,) in loader:
+                x_batch = x_cpu_batch.to(self.device)
+                observed = torch.ones_like(x_batch)
+                holdout = (torch.rand_like(x_batch) < self.holdout_frac).float() * observed
+                train_mask = observed * (1.0 - holdout)
+                for j, model in enumerate(models):
+                    model.train()
+                    optimizers[j].zero_grad(set_to_none=True)
+                    pred = model(x_batch, train_mask)
+                    squared_error = (pred - x_batch).square() * holdout
+                    loss = squared_error.sum() / holdout.sum().clamp_min(1.0)
+                    loss.backward()
+                    optimizers[j].step()
+                    loss_sums[j] += float(loss.detach().item())
+                step += 1
+                seen += 1
+                if step == 1 or step % max(1, len(loader) // 10) == 0 or step == total_steps:
+                    elapsed = time.time() - started
+                    rate = step / max(elapsed, 1e-9)
+                    eta = (total_steps - step) / max(rate, 1e-9)
+                    logger.info(
+                        "IRI fit progress: epoch %d/%d, batch %d/%d (%.1f%%), elapsed %.1fs, ETA %.1fs.",
+                        epoch + 1, n_epochs, step, total_steps, 100.0 * step / total_steps,
+                        elapsed, eta,
+                    )
+            logger.info(
+                "IRI fit epoch %d/%d complete: mean_loss_saits=%.6f mean_loss_brits=%.6f",
+                epoch + 1, n_epochs, loss_sums[0] / max(seen, 1), loss_sums[1] / max(seen, 1),
+            )
+        for model in models:
+            model.eval()
+        self._fitted_models = models
+        logger.info("Reusable IRI ensemble fitted in %.1fs; inference will not retrain per window.",
+                    time.time() - started)
+
+    # ------------------------------------------------------------------ #
+    # 2. Ensemble imputation
     # ------------------------------------------------------------------ #
     def impute_ensemble(self, X_corrupted: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
@@ -306,12 +387,9 @@ class ImputationReliabilityEngine:
         model in parallel, returning both plausible reconstructions
         without collapsing them to a single point estimate.
 
-        Each model is briefly trained in a self-supervised manner: a
-        random subset of the already-observed entries is additionally
-        hidden, and the model is optimized to reconstruct exactly those
-        entries (a masked-autoencoding objective). Observed values are
-        then preserved as-is in the returned output; only genuinely
-        missing positions are replaced by the model's prediction.
+        If fit_reusable_ensemble has been called, this method performs
+        inference only. Otherwise it retains legacy per-window fitting.
+        Observed values are preserved; only masked positions are imputed.
 
         Parameters
         ----------
@@ -349,11 +427,21 @@ class ImputationReliabilityEngine:
             mask.astype(np.float32), device=self.device
         ).unsqueeze(0)  # (1, T, K)
 
-        saits = _SAITSStub(self.n_features, d_model=self.d_model).to(self.device)
-        brits = _BRITSStub(self.n_features, hidden_size=self.d_model).to(self.device)
-
-        saits_out = self._fit_and_reconstruct(saits, x_tensor, mask_tensor)
-        brits_out = self._fit_and_reconstruct(brits, x_tensor, mask_tensor)
+        if self._fitted_models is not None:
+            saits, brits = self._fitted_models
+            saits.eval()
+            brits.eval()
+            with torch.no_grad():
+                saits_pred = saits(x_tensor, mask_tensor)
+                brits_pred = brits(x_tensor, mask_tensor)
+                saits_out = (mask_tensor * x_tensor + (1.0 - mask_tensor) * saits_pred).squeeze(0).cpu().numpy()
+                brits_out = (mask_tensor * x_tensor + (1.0 - mask_tensor) * brits_pred).squeeze(0).cpu().numpy()
+        else:
+            # Legacy standalone mode: fit fresh models for this one window.
+            saits = _SAITSStub(self.n_features, d_model=self.d_model).to(self.device)
+            brits = _BRITSStub(self.n_features, hidden_size=self.d_model).to(self.device)
+            saits_out = self._fit_and_reconstruct(saits, x_tensor, mask_tensor)
+            brits_out = self._fit_and_reconstruct(brits, x_tensor, mask_tensor)
 
         ensemble_outputs = np.stack([saits_out, brits_out], axis=0)  # (2, T, K)
         logger.info(
@@ -377,7 +465,7 @@ class ImputationReliabilityEngine:
         with observed entries copied through unchanged.
         """
         _, T, K = x_tensor.shape
-        holdout = (torch.rand(1, T, K, device=self.device) < self.holdout_frac).float()
+        holdout = (torch.rand_like(mask_tensor) < self.holdout_frac).float()
         holdout = holdout * mask_tensor  # can only hold out truly-observed entries
         train_mask = mask_tensor * (1.0 - holdout)  # what the model is allowed to see
 
@@ -673,14 +761,22 @@ class ImputationReliabilityEngine:
             mask_batch.astype(np.float32), device=self.device
         )  # (B, T, K)
 
-        if self.random_state is not None:
-            torch.manual_seed(self.random_state)
-
-        saits = _SAITSStub(self.n_features, d_model=self.d_model).to(self.device)
-        brits = _BRITSStub(self.n_features, hidden_size=self.d_model).to(self.device)
-
-        saits_out = self._fit_and_reconstruct(saits, x_tensor, mask_tensor)  # (B, T, K)
-        brits_out = self._fit_and_reconstruct(brits, x_tensor, mask_tensor)  # (B, T, K)
+        if self._fitted_models is not None:
+            saits, brits = self._fitted_models
+            saits.eval()
+            brits.eval()
+            with torch.no_grad():
+                saits_pred = saits(x_tensor, mask_tensor)
+                brits_pred = brits(x_tensor, mask_tensor)
+                saits_out = (mask_tensor * x_tensor + (1.0 - mask_tensor) * saits_pred).cpu().numpy()
+                brits_out = (mask_tensor * x_tensor + (1.0 - mask_tensor) * brits_pred).cpu().numpy()
+        else:
+            if self.random_state is not None:
+                torch.manual_seed(self.random_state)
+            saits = _SAITSStub(self.n_features, d_model=self.d_model).to(self.device)
+            brits = _BRITSStub(self.n_features, hidden_size=self.d_model).to(self.device)
+            saits_out = self._fit_and_reconstruct(saits, x_tensor, mask_tensor)
+            brits_out = self._fit_and_reconstruct(brits, x_tensor, mask_tensor)
 
         # Stack: (M=2, B, T, K)
         ensemble = np.stack([saits_out, brits_out], axis=0)

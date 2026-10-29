@@ -83,3 +83,25 @@ def test_create_dataloaders_keeps_timestamps_aligned_after_dropna(tmp_path):
     assert len(train.timestamps) == len(train.X)
     assert len(val.timestamps) == len(val.X)
     assert len(test.timestamps) == len(test.X)
+
+
+
+def test_reusable_iri_ensemble_fits_once_and_supports_batch_inference():
+    rng = np.random.default_rng(7)
+    X = rng.normal(size=(4, 6, 2)).astype(np.float32)
+    engine = ImputationReliabilityEngine(
+        n_features=2, d_model=8, epochs=1, holdout_frac=0.2,
+        random_state=7, device="cpu",
+    )
+    engine.fit_reusable_ensemble(X, batch_size=2, epochs=1)
+    assert engine._fitted_models is not None
+
+    mask = np.ones_like(X, dtype=np.int8)
+    mask[:, 2, 0] = 0
+    corrupted = X.copy()
+    corrupted[mask == 0] = np.nan
+    out = engine.impute_ensemble_batch(corrupted, mask)
+    assert out.shape == (2, 4, 6, 2)
+    assert np.isfinite(out).all()
+    for member in range(2):
+        assert np.allclose(out[member][mask.astype(bool)], X[mask.astype(bool)])
