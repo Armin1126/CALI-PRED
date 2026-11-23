@@ -26,8 +26,7 @@ trust that mean. Calibration metrics are the right tool for exposing this:
       systematic *under*-coverage (true values escaping the interval far
       more often than the nominal miscoverage rate) exactly on the
       segments where the underlying data was degraded.
-    - **Brier score** (implemented here via its continuous generalization,
-      the closed-form Gaussian CRPS) jointly rewards accurate location
+    - **Gaussian CRPS** jointly rewards accurate location
       *and* appropriately-sized spread, penalizing both an interval that
       is too narrow (overconfident) and one that is needlessly too wide
       (underconfident / uninformative).
@@ -41,8 +40,8 @@ Module contents
       coverage curve plus its mean (the standard regression-ECE summary
       statistic used in academic calibration literature, e.g. Kuleshov
       et al., 2018).
-    - ``calculate_brier_score``: closed-form Gaussian CRPS, the continuous
-      generalization of the Brier score.
+    - ``calculate_gaussian_crps``: clearly named closed-form Gaussian CRPS.
+    - ``calculate_brier_score``: backward-compatible legacy alias.
     - ``plot_reliability_diagram``: publication-style two-panel figure —
       a reliability diagram (nominal vs. empirical coverage) and an
       interval-width-vs-data-quality panel showing CALI-PRED's bounds
@@ -233,9 +232,7 @@ def gaussian_interval(mu: np.ndarray, sigma: np.ndarray, confidence_level: float
 
 def calculate_brier_score(y_true: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> float:
     """
-    Compute the continuous generalization of the Brier score for a
-    Gaussian predictive distribution: the closed-form Continuous Ranked
-    Probability Score (CRPS).
+    Backward-compatible legacy name for the closed-form Gaussian CRPS.
 
         CRPS(N(mu, sigma), y) =
             sigma * [ z * (2*Phi(z) - 1) + 2*phi(z) - 1/sqrt(pi) ]
@@ -268,8 +265,8 @@ def calculate_brier_score(y_true: np.ndarray, mu: np.ndarray, sigma: np.ndarray)
 
     Returns
     -------
-    float
-        Mean CRPS ("Brier score") across all N samples.
+        float
+        Mean Gaussian CRPS across all N samples.
 
     Raises
     ------
@@ -294,6 +291,13 @@ def calculate_brier_score(y_true: np.ndarray, mu: np.ndarray, sigma: np.ndarray)
 
     crps = sigma * (z * (2.0 * Phi_cdf - 1.0) + 2.0 * phi_pdf - 1.0 / np.sqrt(np.pi))
     return float(np.mean(crps))
+
+
+def calculate_gaussian_crps(
+    y_true: np.ndarray, mu: np.ndarray, sigma: np.ndarray,
+) -> float:
+    """Clearly named entry point for the closed-form Gaussian CRPS."""
+    return calculate_brier_score(y_true, mu, sigma)
 
 
 # --------------------------------------------------------------------------- #
@@ -590,13 +594,13 @@ if __name__ == "__main__":
         print(f"[OK] Determinism verified: {reduction_pct:.1f}% matches "
               f"expected {_EXPECTED_REDUCTION:.1f}% (seed=7, N=4000).")
 
-        # --- Metric 2: Brier score (continuous CRPS) -------------------------- #
-        brier_base = calculate_brier_score(y_true, mu_pred, sigma_baseline)
-        brier_cali = calculate_brier_score(y_true, mu_pred, sigma_calibrated)
-        print(f"\nBaseline Predictor  -> Brier score (CRPS): {brier_base:.4f}")
-        print(f"CALI-PRED           -> Brier score (CRPS): {brier_cali:.4f}")
-        assert brier_cali < brier_base, "CALI-PRED should achieve a lower (better) Brier score."
-        print("[OK] CALI-PRED achieves a lower (better) Brier score than the baseline.")
+        # --- Metric 2: Gaussian CRPS ----------------------------------------- #
+        brier_base = calculate_gaussian_crps(y_true, mu_pred, sigma_baseline)
+        brier_cali = calculate_gaussian_crps(y_true, mu_pred, sigma_calibrated)
+        print(f"\nBaseline Predictor  -> Gaussian CRPS: {brier_base:.4f}")
+        print(f"CALI-PRED           -> Gaussian CRPS: {brier_cali:.4f}")
+        assert brier_cali < brier_base, "CALI-PRED should achieve a lower (better) Gaussian CRPS."
+        print("[OK] CALI-PRED achieves a lower Gaussian CRPS than the baseline.")
 
         # --- Metric 3: interval width responsiveness to data quality ---------- #
         quality_bin_edges = np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])

@@ -1,0 +1,8 @@
+# Keep Colab's preinstalled CUDA-enabled PyTorch build.
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+joblib
+pytest

@@ -20,7 +20,7 @@ import numpy as np
 
 # Local imports
 from metrics_engine import (
-    calculate_brier_score,
+    calculate_gaussian_crps,
     expected_calibration_curve,
 )
 
@@ -225,13 +225,13 @@ def analyze_dti_binned_breakdown(
         _, _, ece_c = expected_calibration_curve(
             y_true_c[mask], mu_c[mask], sigma_c[mask], nominal_levels
         )
-        crps_c = calculate_brier_score(y_true_c[mask], mu_c[mask], sigma_c[mask])
+        crps_c = calculate_gaussian_crps(y_true_c[mask], mu_c[mask], sigma_c[mask])
 
         # Baseline evaluation within bin
         _, _, ece_b = expected_calibration_curve(
             y_true_b[mask], mu_b[mask], sigma_b[mask], nominal_levels
         )
-        crps_b = calculate_brier_score(y_true_b[mask], mu_b[mask], sigma_b[mask])
+        crps_b = calculate_gaussian_crps(y_true_b[mask], mu_b[mask], sigma_b[mask])
 
         ece_delta = ece_c - ece_b
         crps_delta = crps_c - crps_b

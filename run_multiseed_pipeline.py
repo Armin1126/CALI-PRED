@@ -40,12 +40,18 @@ def main():
     parser.add_argument("--sigma-lr-multiplier", type=float, default=0.50)
     parser.add_argument("--sigma-init-bias", type=float, default=0.50)
     parser.add_argument("--calibration-weight", type=float, default=0.2)
+    parser.add_argument("--iri-epochs", type=int, default=30)
     parser.add_argument("--apply-validation-sigma-scaling", action="store_true",
-                        help="Fit a post-hoc sigma scale on validation data; disabled by default.")
+                        help="Apply validation-fitted uncertainty scaling in the prediction stage.")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--artifact-dir", type=str, default=None,
+                        help="Root directory for per-seed artifacts; defaults to --checkpoint-dir.")
+    parser.add_argument("--mini-run-report", type=str, required=True,
+                        help="Successful development run_config.json required before full experiments.")
     args = parser.parse_args()
 
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    artifact_root = args.artifact_dir or args.checkpoint_dir
+    os.makedirs(artifact_root, exist_ok=True)
     pred_paths = []
 
     for i, seed in enumerate(args.seeds):
@@ -53,7 +59,8 @@ def main():
         logger.info("STARTING SEED RUN %d/%d (Seed = %d)", i + 1, len(args.seeds), seed)
         logger.info("=" * 80)
 
-        seed_ckpt_dir = os.path.join(args.checkpoint_dir, f"seed_{seed}")
+        seed_artifact_dir = os.path.join(artifact_root, f"seed_{seed}")
+        seed_ckpt_dir = os.path.join(seed_artifact_dir, "checkpoints")
         os.makedirs(seed_ckpt_dir, exist_ok=True)
 
         cmd = [
@@ -63,14 +70,16 @@ def main():
             "--stride", str(args.stride),
             "--epochs", str(args.epochs),
             "--checkpoint-dir", seed_ckpt_dir,
+            "--artifact-dir", seed_artifact_dir,
+            "--train-only",
+            "--mini-run-report", args.mini_run_report,
             "--sigma-floor", str(args.sigma_floor),
             "--sigma-lr-multiplier", str(args.sigma_lr_multiplier),
             "--sigma-init-bias", str(args.sigma_init_bias),
             "--calibration-weight", str(args.calibration_weight),
+            "--iri-epochs", str(args.iri_epochs),
             "--seed", str(seed),
         ]
-        if args.apply_validation_sigma_scaling:
-            cmd.append("--apply-validation-sigma-scaling")
         if args.max_windows is not None:
             cmd.extend(["--max-windows", str(args.max_windows)])
 
@@ -78,19 +87,47 @@ def main():
         ret = subprocess.run(cmd)
         if ret.returncode != 0:
             logger.error("Seed %d failed with return code %d", seed, ret.returncode)
-            sys.exit(ret.returncode)
+            raise subprocess.CalledProcessError(ret.returncode, cmd)
 
-        pred_file = os.path.join(seed_ckpt_dir, "test_predictions.npz")
-        if os.path.exists(pred_file):
-            pred_paths.append(pred_file)
+        predict_cmd = [
+            sys.executable, "pipeline.py",
+            "--dataset", args.dataset,
+            "--data-path", args.data_path,
+            "--stride", str(args.stride),
+            "--checkpoint-dir", seed_ckpt_dir,
+            "--artifact-dir", seed_artifact_dir,
+            "--predict-only",
+            "--sigma-floor", str(args.sigma_floor),
+            "--sigma-lr-multiplier", str(args.sigma_lr_multiplier),
+            "--sigma-init-bias", str(args.sigma_init_bias),
+            "--calibration-weight", str(args.calibration_weight),
+            "--iri-epochs", str(args.iri_epochs),
+            "--seed", str(seed),
+        ]
+        if args.apply_validation_sigma_scaling:
+            predict_cmd.append("--apply-validation-sigma-scaling")
+        if args.max_windows is not None:
+            predict_cmd.extend(["--max-windows", str(args.max_windows)])
+        logger.info("Predicting frozen seed %d checkpoints: %s", seed, " ".join(predict_cmd))
+        ret = subprocess.run(predict_cmd)
+        if ret.returncode != 0:
+            logger.error("Prediction for seed %d failed with return code %d", seed, ret.returncode)
+            raise subprocess.CalledProcessError(ret.returncode, predict_cmd)
+
+        pred_file = os.path.join(seed_artifact_dir, "predictions", "test_predictions.npz")
+        if not os.path.isfile(pred_file):
+            raise FileNotFoundError(f"Seed {seed} completed without prediction artifact: {pred_file}")
+        pred_paths.append(pred_file)
 
     logger.info("=" * 80)
     logger.info("ALL SEED RUNS COMPLETE. Running Multi-Seed Coverage Diagnostics...")
     logger.info("=" * 80)
 
-    if pred_paths:
-        run_multiseed_diagnostics(pred_paths, save_dir=args.checkpoint_dir)
-        logger.info("[OK] Multi-seed diagnostics complete. Figure saved in '%s'.", args.checkpoint_dir)
+    if len(pred_paths) != len(args.seeds):
+        raise RuntimeError(f"Expected {len(args.seeds)} seed artifacts; found {len(pred_paths)}.")
+    run_multiseed_diagnostics(pred_paths, save_dir=artifact_root)
+    logger.info("[OK] Multi-seed diagnostics complete. Figure saved in '%s'.", artifact_root)
 
 if __name__ == "__main__":
     main()
+

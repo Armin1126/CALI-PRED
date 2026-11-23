@@ -76,6 +76,11 @@ def compute_sigma_for_window(
 def run_fault_validation(args: argparse.Namespace) -> None:
     """Main fault validation logic."""
 
+    if not args.checkpoint or not os.path.isfile(args.checkpoint):
+        raise FileNotFoundError(
+            f"A trained checkpoint is required for fault evaluation: {args.checkpoint!r}."
+        )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
@@ -114,23 +119,33 @@ def run_fault_validation(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------ #
     # 3. Load or create model
     # ------------------------------------------------------------------ #
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    metadata = checkpoint.get("metadata")
+    required_metadata = ("dataset", "feature_names", "model_config", "seed", "training_config", "code_revision")
+    if not isinstance(metadata, dict) or any(key not in metadata for key in required_metadata):
+        raise ValueError("Checkpoint is missing required dataset/model/training/revision metadata.")
+    if metadata["dataset"] != args.dataset:
+        raise ValueError(f"Checkpoint dataset {metadata['dataset']!r} does not match {args.dataset!r}.")
+    if list(metadata["feature_names"]) != list(train_ds.sensor_cols):
+        raise ValueError("Checkpoint feature names/order do not match the loaded dataset.")
+    model_config = metadata["model_config"]
+    if int(model_config.get("input_dim", -1)) != n_features or int(model_config.get("output_dim", -1)) != n_features:
+        raise ValueError("Checkpoint input/output dimensions do not match the dataset feature count.")
+    if not metadata["code_revision"]:
+        raise ValueError("Checkpoint code revision is missing; refusing unauditable fault evaluation.")
     model = CaliPredTransformer(
-        input_dim=n_features, output_dim=n_features,
-        d_model=64, n_heads=4, n_layers=3,
+        input_dim=n_features,
+        output_dim=n_features,
+        d_model=int(model_config["d_model"]),
+        n_heads=int(model_config["n_heads"]),
+        n_layers=int(model_config["n_layers"]),
+        max_uncertainty_inflation=float(model_config.get("max_inflation", 10.0)),
+        sigma_floor=float(model_config.get("sigma_floor", 0.1)),
+        use_trust_attention=bool(model_config.get("use_trust_attention", True)),
+        use_uncertainty_inflation=bool(model_config.get("use_uncertainty_inflation", True)),
     ).to(device)
-
-    ckpt_path = os.path.join(args.checkpoint_dir, "best_model_calipred.pt")
-    if os.path.exists(ckpt_path):
-        model.load_state_dict(
-            torch.load(ckpt_path, map_location=device, weights_only=False)["model_state_dict"]
-        )
-        logger.info("Loaded trained model from '%s'.", ckpt_path)
-    else:
-        logger.warning(
-            "No checkpoint found at '%s'. Using untrained model — "
-            "sigma inflation should still work due to architectural guarantee.",
-            ckpt_path,
-        )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    logger.info("Loaded trained model from '%s' (seed=%s, revision=%s).", args.checkpoint, metadata["seed"], metadata["code_revision"])
 
     # ------------------------------------------------------------------ #
     # 4. Run fault validation
@@ -295,7 +310,8 @@ if __name__ == "__main__":
         "--data-path", type=str, default="data/metropt/MetroPT3(AirCompressor).csv",
     )
     parser.add_argument("--n-windows", type=int, default=10)
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to a trained CALI-PRED checkpoint with run metadata.")
 
     args = parser.parse_args()
     run_fault_validation(args)

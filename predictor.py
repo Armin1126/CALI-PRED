@@ -334,6 +334,8 @@ class CaliPredTransformer(nn.Module):
         sigma_floor: float = 0.1,
         use_temperature: bool = False,
         sigma_init_bias: float = 0.5,
+        use_trust_attention: bool = True,
+        use_uncertainty_inflation: bool = True,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -342,6 +344,8 @@ class CaliPredTransformer(nn.Module):
         self.max_uncertainty_inflation = max_uncertainty_inflation
         self.sigma_floor = sigma_floor
         self.use_temperature = use_temperature
+        self.use_trust_attention = bool(use_trust_attention)
+        self.use_uncertainty_inflation = bool(use_uncertainty_inflation)
 
         self.input_proj = nn.Linear(input_dim, d_model)
         self.register_buffer(
@@ -416,8 +420,9 @@ class CaliPredTransformer(nn.Module):
         h = self.input_proj(x) + self.positional_encoding[:, :T, :]  # [B, T, D]
 
         attn_maps: List[Tensor] = []
+        attention_dti = dti if self.use_trust_attention else torch.ones_like(dti)
         for layer in self.layers:
-            h, attn_weights = layer(h, dti)  # [B, T, D], [B, H, T, T]
+            h, attn_weights = layer(h, attention_dti)  # [B, T, D], [B, H, T, T]
             attn_maps.append(attn_weights)
 
         mu = self.mu_head(h)  # [B, T, O]
@@ -447,6 +452,8 @@ class CaliPredTransformer(nn.Module):
         This public helper is shared by ``forward`` and diagnostics so reported
         base sigma and inflation are exactly the quantities used by the model.
         """
+        if not self.use_uncertainty_inflation:
+            return torch.ones_like(dti)
         alpha = F.softplus(self.trust_sensitivity_raw) + 1e-3
         dti_safe = dti.clamp(0.0, 1.0) + eps
         inflation_factor = torch.pow(1.0 / dti_safe, alpha)
