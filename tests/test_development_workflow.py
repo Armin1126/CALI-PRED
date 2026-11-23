@@ -118,6 +118,21 @@ class DevelopmentWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different shapes"):
             validate_prediction_artifact(invalid_shape, "one_step_forecast")
 
+    def test_target_timestamps_follow_final_forecast_horizon(self):
+        from pipeline import _dataset_target_timestamps
+
+        class TinyWindowDataset:
+            timestamps = np.arange(20, dtype=np.float64) * 10.0
+            windows = [0, 3, 6]
+            window_size = 4
+            forecast_horizon = 1
+
+        class CachedDataset:
+            base_dataset = TinyWindowDataset()
+
+        actual = _dataset_target_timestamps(CachedDataset())
+        np.testing.assert_array_equal(actual, np.array([40.0, 70.0, 100.0]))
+
     def test_saved_prediction_calibration_uses_validation_only(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "validation_predictions.npz"
