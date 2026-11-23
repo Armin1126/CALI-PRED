@@ -855,15 +855,28 @@ def evaluate_model(
 
 
 def _dataset_target_timestamps(dataset) -> np.ndarray:
-    """Get target timestamps through the pipeline's Subset/cache wrappers."""
+    """Get one target timestamp per window through cache/subset wrappers."""
     if hasattr(dataset, "base_dataset"):
         return _dataset_target_timestamps(dataset.base_dataset)
     if hasattr(dataset, "indices") and hasattr(dataset, "dataset"):
         return _dataset_target_timestamps(dataset.dataset)[list(dataset.indices)]
     timestamps = getattr(dataset, "target_timestamps", None)
-    if timestamps is None:
-        raise ValueError("Dataset does not expose target timestamps.")
-    return np.asarray(timestamps)
+    if timestamps is not None:
+        return np.asarray(timestamps)
+
+    # RealDataset and create_dataloaders' _SlicedDataset expose row timestamps
+    # plus each window's start index. The pipeline scores the final output
+    # position, whose target is shifted by forecast_horizon rows.
+    row_timestamps = getattr(dataset, "timestamps", None)
+    windows = getattr(dataset, "windows", None)
+    window_size = getattr(dataset, "window_size", None)
+    horizon = getattr(dataset, "forecast_horizon", None)
+    if row_timestamps is not None and windows is not None and window_size is not None and horizon is not None:
+        target_indices = np.asarray(windows, dtype=np.int64) + int(window_size) - 1 + int(horizon)
+        if np.any(target_indices < 0) or np.any(target_indices >= len(row_timestamps)):
+            raise ValueError("Dataset window metadata produces out-of-range target timestamps.")
+        return np.asarray(row_timestamps)[target_indices]
+    raise ValueError("Dataset does not expose target timestamps or window timestamp metadata.")
 
 
 def _dataset_sensor_cols(dataset):
